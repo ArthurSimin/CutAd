@@ -88,6 +88,7 @@ enum LiveControl {
     Text,
     Transform,
     Motion,
+    VisualFade,
     Color,
     Mask,
     Gain,
@@ -1708,7 +1709,7 @@ impl Editor {
                 .as_ref()
                 .is_some_and(|(edit, _)| self.project.tracks[edit.row].kind == TrackKind::Video)
             {
-                ui.selectable_value(&mut self.inspector_tab, InspectorTab::Motion, "Motion");
+                ui.selectable_value(&mut self.inspector_tab, InspectorTab::Motion, "Animation");
                 ui.selectable_value(&mut self.inspector_tab, InspectorTab::Mask, "Mask");
             }
             ui.selectable_value(&mut self.inspector_tab, InspectorTab::Color, "Color");
@@ -1763,7 +1764,6 @@ impl Editor {
     }
 
     fn motion_inspector(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Position keyframes");
         let Some(id) = self.selection.clip.clone() else {
             ui.label("Select a video, image, or text clip.");
             return;
@@ -1772,6 +1772,23 @@ impl Editor {
             return;
         };
         let clip = &self.project.tracks[row].clips[index];
+        let fade = clip.visual_fade;
+        let mut fades = [fade.in_frames, fade.out_frames];
+        let mut apply_preset = false;
+        ui.heading("Clip fades");
+        Self::fade_controls(ui, "visual_fades", clip.length, &mut fades);
+        ui.horizontal(|ui| {
+            if ui.button("Fade both").clicked() {
+                let duration = (FPS / 2).min(clip.length.div_ceil(2));
+                fades = [duration; 2];
+                apply_preset = true;
+            }
+            if ui.button("Clear fades").clicked() {
+                fades = [0; 2];
+            }
+        });
+        ui.separator();
+        ui.heading("Position keyframes");
         let in_clip = (clip.start..clip.end()).contains(&self.frame);
         let local = self.frame.saturating_sub(clip.start).min(clip.length - 1);
         let mut position = clip.position_at(local);
@@ -1859,6 +1876,14 @@ impl Editor {
             if let Err(error) = result {
                 self.error("Edit motion", error);
             }
+        }
+        if apply_preset || fades != [fade.in_frames, fade.out_frames] {
+            self.update_selected_clip(LiveControl::VisualFade, |clip| {
+                if apply_preset {
+                    clip.visual_fade = project::ClipFade::default();
+                }
+                clip.set_visual_fade(fades[0], fades[1]);
+            });
         }
     }
 
@@ -2014,42 +2039,18 @@ impl Editor {
             return;
         }
         let mut gain = clip.gain;
-        let mut fade_in = clip.audio_fade.in_frames;
-        let mut fade_out = clip.audio_fade.out_frames;
+        let original_fades = [clip.audio_fade.in_frames, clip.audio_fade.out_frames];
+        let mut fades = original_fades;
         ui.add(
             egui::Slider::new(&mut gain, 0.0..=4.0)
                 .text("Clip gain")
                 .suffix("×"),
         );
-        egui::Grid::new("audio_fades")
-            .num_columns(2)
-            .show(ui, |ui| {
-                for (name, length) in [("Fade in", &mut fade_in), ("Fade out", &mut fade_out)] {
-                    ui.label(name);
-                    let mut seconds = f64::from(*length) / f64::from(FPS);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut seconds)
-                                .range(0.0..=f64::from(clip.length.max(*length)) / f64::from(FPS))
-                                .speed(0.033)
-                                .suffix(" s")
-                                .fixed_decimals(2),
-                        )
-                        .changed()
-                    {
-                        *length = (seconds * f64::from(FPS)).round() as u32;
-                    }
-                    ui.end_row();
-                }
-            });
-        let changed_fades =
-            (fade_in, fade_out) != (clip.audio_fade.in_frames, clip.audio_fade.out_frames);
-        if gain != clip.gain || changed_fades {
+        Self::fade_controls(ui, "audio_fades", clip.length, &mut fades);
+        if gain != clip.gain || fades != original_fades {
             self.update_selected_clip(LiveControl::Gain, |clip| {
                 clip.gain = gain;
-                if changed_fades {
-                    clip.set_audio_fade(fade_in, fade_out);
-                }
+                clip.set_audio_fade(fades[0], fades[1]);
             });
         }
         if ui.button("Browse audio effects").clicked() {
@@ -2058,6 +2059,28 @@ impl Editor {
             self.audio_presets = true;
             self.inspector_tab = InspectorTab::Effects;
         }
+    }
+
+    fn fade_controls(ui: &mut egui::Ui, id: &str, clip_length: u32, fades: &mut [u32; 2]) {
+        egui::Grid::new(id).num_columns(2).show(ui, |ui| {
+            for (name, length) in ["Fade in", "Fade out"].into_iter().zip(fades) {
+                ui.label(name);
+                let mut seconds = f64::from(*length) / f64::from(FPS);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut seconds)
+                            .range(0.0..=f64::from(clip_length.max(*length)) / f64::from(FPS))
+                            .speed(0.033)
+                            .suffix(" s")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    *length = (seconds * f64::from(FPS)).round() as u32;
+                }
+                ui.end_row();
+            }
+        });
     }
 
     fn clip_inspector(&mut self, ui: &mut egui::Ui) {
@@ -2117,7 +2140,7 @@ impl Editor {
                         );
                         ui.end_row();
                     });
-                if ui.button("Position keyframes…").clicked() {
+                if ui.button("Animations and keyframes…").clicked() {
                     self.inspector_tab = InspectorTab::Motion;
                 }
                 if ui.button("Reset transform").clicked() {

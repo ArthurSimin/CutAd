@@ -1165,6 +1165,7 @@ fn filter_graph(
                 ));
                 source = format!("[masked{index}]null");
             }
+            append_visual_fades(&mut source, layer, raster);
             let start = layer.start * factor;
             let end = start + layer.length * factor;
             if clip.transform == Transform::default() && clip.position_animation.is_empty() {
@@ -1422,6 +1423,36 @@ fn title_source(
     passes.join(",")
 }
 
+fn append_visual_fades(source: &mut String, layer: &Layer<'_>, raster: Raster) {
+    let fade = layer.clip.visual_fade;
+    if fade.is_empty() {
+        return;
+    }
+    let rate = raster.rate;
+    let alpha = raster.alpha();
+    let (first, end) = fade.anchors(layer.clip.length);
+    for (kind, start, duration) in [
+        ("in", first, fade.in_frames),
+        ("out", end - i64::from(fade.out_frames), fade.out_frames),
+    ] {
+        let start = start - i64::from(layer.skip);
+        if duration == 0
+            || (kind == "in" && start + i64::from(duration) <= 0)
+            || (kind == "out" && start >= i64::from(layer.length))
+        {
+            continue;
+        }
+        // Shift timestamps when the preview starts inside a fade so it retains its progress.
+        let elapsed = (-start).max(0) * i64::from(rate / FPS);
+        let delay = seconds(start.max(0) as u32);
+        let duration = seconds(duration);
+        source.push_str(&format!(
+            ",format={alpha},settb=1/{rate},setpts=N+{elapsed},\
+             fade=t={kind}:st={delay}:d={duration}:alpha=1,setpts=N"
+        ));
+    }
+}
+
 fn position_expression(layer: &Layer<'_>, axis: usize, dimension: usize) -> String {
     let clip = layer.clip;
     let keys = &clip.position_animation.keys;
@@ -1510,16 +1541,17 @@ fn transition_layer(
     let frames = duration * factor;
     let start_tail = start - 1;
     let cross_length = frames + 1;
+    let end = start + layer.length * factor;
     graph.extend([
         format!("[{background}]split=2[base{index}][previous{index}]"),
         format!("[previous{index}]trim=start_frame={start_tail}:end_frame={start},\
                  settb=1/{rate},setpts=N,format=yuv444p,tpad=stop_mode=clone:stop={frames}[from{index}]"),
-        format!("[visual{index}]split=2[current{index}][incoming{index}]"),
-        format!("[incoming{index}]trim=end_frame={cross_length},settb=1/{rate},\
-                 setpts=N,format=yuv444p,tpad=stop_mode=clone:stop=1[to{index}]"),
+        overlay(&format!("base{index}"), &format!("visual{index}"), &format!("scene{index}"), start, end, raster),
+        format!("[scene{index}]split=2[full{index}][incoming{index}]"),
+        format!("[incoming{index}]trim=start_frame={start}:end_frame={},settb=1/{rate},\
+                 setpts=N,format=yuv444p,tpad=stop_mode=clone:stop=1[to{index}]", start + cross_length),
         format!("[from{index}][to{index}]xfade=transition={}:duration={}:offset=0,\
                  trim=end_frame={frames},settb=1/{rate},setpts=N+{start}[blend{index}]", t.kind.filter(), seconds(duration)),
-        overlay(&format!("base{index}"), &format!("current{index}"), &format!("full{index}"), start, start + layer.length * factor, raster),
         overlay(&format!("full{index}"), &format!("blend{index}"), &format!("layer{index}"), start, start + frames, raster),
     ]);
     format!("layer{index}")

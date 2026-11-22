@@ -303,7 +303,7 @@ impl Default for ClipMask {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
-pub struct AudioFade {
+pub struct ClipFade {
     pub in_frames: u32,
     pub out_frames: u32,
     // Signed frame offsets from the respective clip edges retain partial fades after a cut.
@@ -317,8 +317,10 @@ fn is_zero(value: &i32) -> bool {
     *value == 0
 }
 
-impl AudioFade {
-    fn is_empty(&self) -> bool {
+pub type AudioFade = ClipFade;
+
+impl ClipFade {
+    pub(crate) fn is_empty(&self) -> bool {
         self.in_frames == 0 && self.out_frames == 0
     }
 
@@ -327,6 +329,47 @@ impl AudioFade {
             i64::from(self.in_offset),
             i64::from(length) + i64::from(self.out_offset),
         )
+    }
+
+    fn set(&mut self, in_frames: u32, out_frames: u32, length: u32) {
+        if self.in_frames != in_frames {
+            self.in_frames = in_frames.min(length);
+            self.in_offset = 0;
+        }
+        if self.out_frames != out_frames {
+            self.out_frames = out_frames.min(length);
+            self.out_offset = 0;
+        }
+    }
+
+    fn split(&mut self, offset: u32, tail_length: u32) -> Self {
+        let mut tail = *self;
+        if tail.in_frames > 0 {
+            tail.in_offset -= offset as i32;
+            tail.discard_inactive();
+        }
+        if self.out_frames > 0 {
+            self.out_offset += tail_length as i32;
+            self.discard_inactive();
+        }
+        tail
+    }
+
+    fn trim(&mut self, leading: i32, trailing: i32) {
+        if self.in_offset != 0 {
+            self.in_offset -= leading;
+        }
+        if self.out_offset != 0 {
+            self.out_offset += trailing;
+        }
+        self.discard_inactive();
+    }
+
+    fn valid(self) -> bool {
+        self.in_frames <= MAX_FRAMES
+            && self.out_frames <= MAX_FRAMES
+            && self.in_offset.unsigned_abs() <= 2 * MAX_FRAMES
+            && self.out_offset.unsigned_abs() <= 2 * MAX_FRAMES
     }
 
     fn discard_inactive(&mut self) {
@@ -393,6 +436,8 @@ pub struct Clip {
     pub adjustment: ColorAdjustment,
     #[serde(default, skip_serializing_if = "AudioFade::is_empty")]
     pub audio_fade: AudioFade,
+    #[serde(default, skip_serializing_if = "ClipFade::is_empty")]
+    pub visual_fade: ClipFade,
     #[serde(default)]
     pub freeze: bool,
 }
@@ -415,19 +460,17 @@ impl Clip {
             mask: None,
             adjustment: ColorAdjustment::default(),
             audio_fade: AudioFade::default(),
+            visual_fade: ClipFade::default(),
             freeze: false,
         }
     }
 
     pub fn set_audio_fade(&mut self, in_frames: u32, out_frames: u32) {
-        if self.audio_fade.in_frames != in_frames {
-            self.audio_fade.in_frames = in_frames.min(self.length);
-            self.audio_fade.in_offset = 0;
-        }
-        if self.audio_fade.out_frames != out_frames {
-            self.audio_fade.out_frames = out_frames.min(self.length);
-            self.audio_fade.out_offset = 0;
-        }
+        self.audio_fade.set(in_frames, out_frames, self.length);
+    }
+
+    pub fn set_visual_fade(&mut self, in_frames: u32, out_frames: u32) {
+        self.visual_fade.set(in_frames, out_frames, self.length);
     }
 
     pub fn position_at(&self, relative_frame: u32) -> [f32; 2] {
@@ -615,14 +658,8 @@ impl Project {
             tail.position_animation.offset =
                 tail.position_animation.offset.saturating_add(offset as i32);
         }
-        if tail.audio_fade.in_frames > 0 {
-            tail.audio_fade.in_offset -= offset as i32;
-            tail.audio_fade.discard_inactive();
-        }
-        if clip.audio_fade.out_frames > 0 {
-            clip.audio_fade.out_offset += tail.length as i32;
-            clip.audio_fade.discard_inactive();
-        }
+        tail.audio_fade = clip.audio_fade.split(offset, tail.length);
+        tail.visual_fade = clip.visual_fade.split(offset, tail.length);
         tail.transition = None;
         clip.length = offset;
         let id = tail.id.clone();
@@ -809,19 +846,20 @@ impl Project {
         let (previous, index) = self.location(id).context("Select a clip.")?;
         let mut clip = self.tracks[previous].clips.remove(index);
         let end = start.saturating_add(length);
-        if clip.end() == end {
+        let (leading_trim, trailing_trim) = if clip.end() == end {
             let delta = start.min(MAX_FRAMES) as i32 - clip.start as i32;
             if !clip.position_animation.is_empty() {
                 clip.position_animation.offset =
                     clip.position_animation.offset.saturating_add(delta);
             }
-            if clip.audio_fade.in_offset != 0 {
-                clip.audio_fade.in_offset -= delta;
-            }
-        } else if clip.start == start && clip.audio_fade.out_offset != 0 {
-            clip.audio_fade.out_offset += clip.end() as i32 - end.min(MAX_FRAMES) as i32;
-        }
-        clip.audio_fade.discard_inactive();
+            (delta, 0)
+        } else if clip.start == start {
+            (0, clip.end() as i32 - end.min(MAX_FRAMES) as i32)
+        } else {
+            (0, 0)
+        };
+        clip.audio_fade.trim(leading_trim, trailing_trim);
+        clip.visual_fade.trim(leading_trim, trailing_trim);
         clip.start = start;
         clip.source = source;
         clip.length = length;
@@ -939,13 +977,9 @@ impl Project {
                         && (0.0..=1.0).contains(&mask.feather)),
                     "Invalid clip mask."
                 );
-                let fade = clip.audio_fade;
                 ensure!(
-                    fade.in_frames <= MAX_FRAMES
-                        && fade.out_frames <= MAX_FRAMES
-                        && fade.in_offset.unsigned_abs() <= 2 * MAX_FRAMES
-                        && fade.out_offset.unsigned_abs() <= 2 * MAX_FRAMES,
-                    "Invalid audio fade settings."
+                    clip.audio_fade.valid() && clip.visual_fade.valid(),
+                    "Invalid clip fade settings."
                 );
                 ensure!(
                     track.kind.accepts(asset),

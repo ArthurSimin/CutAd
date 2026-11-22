@@ -40,7 +40,7 @@ GitHub builds Linux releases on Ubuntu 24.04. Build from source if your distribu
 
 See the [CapCut workflow inventory](CAPCUT_WORKFLOWS.md) and [setup evidence](SETUP_EVIDENCE.md) for the public feature reference and installer inspection.
 
-CutAd includes 41 presets across color, lens, motion, texture and audio, plus eight transitions. Higher numbered video tracks are composited in front of lower numbered tracks. The timeline uses 30 ticks per second. Select a visual clip and open **Motion** to add a position keyframe at the playhead. Move the playhead and edit X or Y to create a second keyframe. Diamonds mark the keyframes on the timeline.
+CutAd includes 41 presets across color, lens, motion, texture and audio, plus eight transitions. Higher numbered video tracks are composited in front of lower numbered tracks. The timeline uses 30 ticks per second. Select a visual clip and open **Animation** to set **Fade in** and **Fade out** in seconds. **Fade both** applies up to half a second at each end. Fades render in preview and export and survive splits and trims. The inspector also lets you add a position keyframe at the playhead. Move the playhead and edit X or Y to create a second keyframe. Diamonds mark the keyframes on the timeline.
 
 ## Import stickers and add text
 
