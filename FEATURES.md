@@ -1,0 +1,23 @@
+# CutAd desktop workflow coverage
+
+Reference checked November 21, 2026. CapCut documents both desktop editing tools and subscription features across multiple products. The table tracks the documented workflows against CutAd 0.6.0. [CapCut desktop editor](https://www.capcut.com/resource/pc-professional-video-editor) · [Editing guide](https://www.capcut.com/resource/how-to-use-capcut) · [Pro features](https://www.capcut.com/help/capcut-standard-vs-pro)
+
+| Workflow | CutAd 0.6.0 | Verification |
+| --- | --- | --- |
+| Local media, multitrack editing, and export | Import video, stills, and audio. Split, trim, move, duplicate, detach audio, undo and redo, save and reopen. Export MP4, WebM, or lossless MKV at 24, 30, 60, or 120 fps. New timelines can match first-video dimensions up to a 4096-pixel edge. | Linux integration tests and Windows integration tests under Wine. |
+| Playhead preview and live controls | Auto uses responsive scrubbing and playback with full-canvas stills. Full, half, and quarter preview modes are available. Cached scrubbing and short buffered playback bound the work. Text, transform, color, and gain edits apply immediately. Decode and compositing time still depend on footage and effects. | Integration tests compare partial previews against full renders. |
+| Text, fonts, and stickers | Seven editable title styles with optional background boxes, typography controls, system fonts, local font imports, DaFont categories and direct URL installs, curated open fonts, and local still-image overlays. | Title and font import tests, plus preview and export checks. |
+| Effects and transitions | 41 independently defined color, lens, motion, texture, and audio presets, eight cut transitions, clip transforms, and audio gain. Some editing workflows such as preset effects use an apply action. | Integration render tests. |
+| Color correction and green-screen removal | Live brightness, contrast, saturation, and custom chroma color, tolerance, and softness. | Tests verify the keyed layer and grading in the shared preview and export renderer. |
+| Templates and draft interchange | Reusable CutAd templates and import of supported local, readable CapCut draft JSON. Missing media becomes replaceable slots. Hosted template catalogs and unsupported draft settings require other workflows. | Generated draft fixtures and project round-trip tests. |
+| Animation and finishing | Editable X/Y position keyframes animate video, images, and text. Scale, rotation, and opacity keyframes, blend modes, speed curves, optical flow, advanced grading, and built-in voiceover recording are pending. Rectangle, ellipse, and linear clip masks support feathering and inversion. | Position interpolation, split, project reopen, and preview tests. [CapCut keyframe workflow](https://www.capcut.com/resource/how-to-add-keyframes-in-capcut) |
+| Captions, tracking, and audio cleanup | SRT import and export support editable captions. Offline automatic captions use local whisper.cpp and a compatible model. Motion tracking, auto reframe, background separation, voice isolation, and advanced cleanup are pending. | SRT timecodes, overlaps, and project round-trip tests. [CapCut subtitle workflow](https://www.capcut.com/help/how-to-import-subtitles) |
+| Source quality | Full-canvas 4:4:4 stills and a lossless FFV1/FLAC master of the rendered edit. The editor composites 8-bit SDR at the canvas dimensions and uses a 48 kHz stereo mix. HDR and unrestricted native frame rates remain open. | Tests compare adjacent 60 fps source frames and verify pixel equality on a same-size, unedited 4:4:4 sample. |
+| Audio and still exports | Timeline waveforms, clip gain and fades, stereo WAV export, and full-canvas PNG export at the playhead. | Linux and Windows build checks with generated media. |
+| Hosted media and collaboration | Commercial asset catalogs, generative media, shared projects, brand libraries, and team review are separate service workflows. | Pending implementation. |
+
+See the [desktop workflow inventory](CAPCUT_WORKFLOWS.md) for the broader free and Pro catalog and the [setup evidence report](SETUP_EVIDENCE.md) for the complete extracted file hashes.
+
+## Installer evidence
+
+REA CLI 6.5.0 inspected `CapCut_7710642509730349063_installer.exe` in read-only mode. SHA-256 `69dbc6f939bf4ac63a90dc56e1e9600b4d4284848a99c4190423c3f856c5961e`. Evidence ID `ev_cf2195c2db2306abf10013d6706b6428ea39c5ced696625772c6a4e28c24f78d`. The evidence covers the 32-bit package’s PE resource inventory. The workflow references above describe the shipped editor’s user-facing functionality.

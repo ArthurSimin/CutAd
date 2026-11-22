@@ -1,0 +1,14 @@
+scale 2,2
+push gradient 'violet' linear 15,4 106,128
+ stop-color '#a68bff' 0
+ stop-color '#633eef' 1
+pop gradient
+push graphic-context
+fill url(#violet)
+stroke none
+roundrectangle 6,6 122,122 29,29
+pop graphic-context
+fill '#ffffff'
+path 'M86,43 C74,28 50,26 37,41 C24,57 27,82 43,94 C57,103 76,101 86,91 L75,79 C69,85 60,87 53,83 C44,78 42,67 47,59 C53,50 65,48 74,55 Z'
+fill '#d9cbff'
+path 'M91,45 C93,43 97,44 99,46 L104,52 C106,54 105,57 103,59 L78,81 L68,69 Z'
