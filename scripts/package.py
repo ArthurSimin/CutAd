@@ -20,7 +20,7 @@ output = Path("dist")
 output.mkdir(exist_ok=True)
 
 def cargo(*flags):
-    return subprocess.check_output(["cargo", *flags, "--locked"], text=True)
+    return subprocess.check_output(["cargo", *flags, "--locked"], encoding="utf-8")
 
 metadata = json.loads(cargo("metadata", "--format-version=1", "--filter-platform", args.target))
 packages = {(p["name"], p["version"]): p for p in metadata["packages"]}
@@ -57,7 +57,9 @@ with tempfile.TemporaryDirectory() as scratch:
                 shutil.copy2(file, dest)
     (stage / "DEPENDENCIES.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if args.platform.startswith("windows"):
-        with zipfile.ZipFile(output / f"{stage.name}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+        with zipfile.ZipFile(
+            output / f"{stage.name}.zip", "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
+        ) as archive:
             for file in sorted(stage.rglob("*")):
                 if file.is_file():
                     archive.write(file, file.relative_to(stage.parent))
