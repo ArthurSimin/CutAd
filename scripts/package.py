@@ -15,7 +15,7 @@ parser.add_argument("platform", choices=("linux-x86_64", "windows-x86_64"))
 parser.add_argument("binary", type=Path)
 parser.add_argument("version")
 args = parser.parse_args()
-assert re.fullmatch(r"\d+\.\d+\.\d+", args.version)
+assert re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", args.version)
 output = Path("dist")
 output.mkdir(exist_ok=True)
 
