@@ -81,6 +81,7 @@ presets! {
     FadeIn, Motion, "Fade in", "Reveal the clip from transparency";
     FadeOut, Motion, "Fade out", "Fade the clip into transparency";
     WhiteReveal, Motion, "White reveal", "Reveal the image from a white flash";
+    MotionBlur, Motion, "Motion blur", "Blend recent video frames to soften fast motion";
     MotionTrail, Motion, "Motion trail", "Leave fading traces behind moving highlights";
 
     FilmNoise, Texture, "Film grain", "Add uniform animated grain";
@@ -121,6 +122,13 @@ impl Effect {
 }
 
 impl Preset {
+    pub(crate) fn visual_preroll(self) -> Option<u32> {
+        match self {
+            Self::MotionBlur => Some(2),
+            _ => None,
+        }
+    }
+
     pub fn audio(self) -> bool {
         self.category() == Category::Audio
     }
@@ -222,6 +230,16 @@ impl Preset {
             Self::FadeIn => format!("fade=t=in:s=0:n={fade}:alpha=1"),
             Self::FadeOut => format!("fade=t=out:s={tail}:n={fade}:alpha=1"),
             Self::WhiteReveal => format!("fade=t=in:s=0:n={fade}:color=white"),
+            Self::MotionBlur => {
+                let history = (rate / 15).clamp(2, 8);
+                let weight = a * 0.8 / f64::from(history);
+                let weights = format!(
+                    "{}{:.4}",
+                    format!("{weight:.4} ").repeat(history as usize),
+                    1.0 - 0.8 * a
+                );
+                format!("tmix=frames={}:weights='{weights}'", history + 1)
+            }
             Self::MotionTrail => format!("lagfun=decay={:.4}", 0.65 + 0.33 * a),
 
             Self::FilmNoise => format!(

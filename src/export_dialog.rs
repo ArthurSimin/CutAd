@@ -1,26 +1,46 @@
 use crate::theme::{ACCENT, BACK, LINE, MUTED};
 use cutad::{
-    media::{Format, Output, Quality},
-    project::{Project, timestamp},
+    media::{ExportDetails, Format, Output, Quality},
+    project::{FPS, Project, timestamp},
 };
 use eframe::egui::{self, Align, Layout, RichText, Sense, Stroke, StrokeKind, vec2};
+use std::ops::Range;
 use std::path::PathBuf;
 
 pub enum Decision {
     Cancel,
-    Render(PathBuf, Output),
+    Render(PathBuf, Output, Range<u32>, ExportDetails),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    EntireEdit,
+    SelectedClip,
+    Custom,
 }
 
 pub struct ExportDialog {
     settings: Output,
     destination: Option<PathBuf>,
+    scope: Scope,
+    selection: Option<Range<u32>>,
+    custom_range: Range<u32>,
+    title: String,
+    include_cover: bool,
+    cover_frame: u32,
 }
 
 impl ExportDialog {
-    pub fn new(project: &Project) -> Self {
+    pub fn new(project: &Project, selection: Option<Range<u32>>, playhead: u32) -> Self {
         Self {
             settings: Output::for_project(Format::Mp4, project),
             destination: None,
+            scope: Scope::EntireEdit,
+            selection,
+            custom_range: 0..project.duration(),
+            title: String::new(),
+            include_cover: false,
+            cover_frame: playhead.min(project.duration().saturating_sub(1)),
         }
     }
 
@@ -67,7 +87,8 @@ impl ExportDialog {
                             .width(156.0)
                             .selected_text(format_name(self.settings.format))
                             .show_ui(ui, |ui| {
-                                for format in [Format::Mp4, Format::Webm, Format::Mkv] {
+                                for format in [Format::Mp4, Format::Webm, Format::Mkv, Format::Gif]
+                                {
                                     ui.selectable_value(
                                         &mut self.settings.format,
                                         format,
@@ -77,6 +98,9 @@ impl ExportDialog {
                             });
                         if previous != self.settings.format {
                             self.destination = None;
+                            if previous == Format::Gif || self.settings.format == Format::Gif {
+                                self.settings = Output::for_project(self.settings.format, project);
+                            }
                         }
                         ui.end_row();
                         ui.label("Resolution");
@@ -108,7 +132,12 @@ impl ExportDialog {
                             .width(156.0)
                             .selected_text(format!("{} fps", self.settings.fps))
                             .show_ui(ui, |ui| {
-                                for rate in [24, 30, 60, 120] {
+                                let rates = if self.settings.format == Format::Gif {
+                                    [12, 15, 24, 30]
+                                } else {
+                                    [24, 30, 60, 120]
+                                };
+                                for rate in rates {
                                     ui.selectable_value(
                                         &mut self.settings.fps,
                                         rate,
@@ -117,8 +146,13 @@ impl ExportDialog {
                                 }
                             });
                         ui.end_row();
-                        ui.label("Quality");
-                        if self.settings.format == Format::Mkv {
+                        if self.settings.format != Format::Gif {
+                            ui.label("Quality");
+                        }
+                        if self.settings.format == Format::Gif {
+                            ui.label("Loop");
+                            ui.label("Continuous");
+                        } else if self.settings.format == Format::Mkv {
                             ui.label("Lossless video and audio");
                         } else {
                             egui::ComboBox::from_id_salt("quality")
@@ -144,6 +178,56 @@ impl ExportDialog {
                     RichText::new("FFV1 and FLAC preserve the rendered edit. Files can be large.")
                         .color(MUTED),
                 );
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Export range");
+                ui.selectable_value(&mut self.scope, Scope::EntireEdit, "Entire edit");
+                if self.selection.is_some() {
+                    ui.selectable_value(&mut self.scope, Scope::SelectedClip, "Selected clip");
+                }
+                ui.selectable_value(&mut self.scope, Scope::Custom, "Custom");
+            });
+            if self.scope == Scope::Custom {
+                ui.horizontal(|ui| {
+                    ui.label("In");
+                    range_boundary(ui, &mut self.custom_range.start, project.duration());
+                    ui.label("Out");
+                    range_boundary(ui, &mut self.custom_range.end, project.duration());
+                });
+            }
+            let range = match self.scope {
+                Scope::EntireEdit => 0..project.duration(),
+                Scope::SelectedClip => self.selection.clone().unwrap_or_default(),
+                Scope::Custom => self.custom_range.clone(),
+            };
+            let valid_range = range.start < range.end && range.end <= project.duration();
+            if !valid_range {
+                ui.label("Set Out later than In within the timeline.");
+            }
+            if self.settings.format != Format::Gif {
+                ui.collapsing("Title and cover", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Title");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.title)
+                                .char_limit(512)
+                                .desired_width(300.0),
+                        );
+                    });
+                    if self.settings.format == Format::Mp4 {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.include_cover, "Embed frame as cover");
+                            if self.include_cover {
+                                range_boundary(
+                                    ui,
+                                    &mut self.cover_frame,
+                                    project.duration().saturating_sub(1),
+                                );
+                            }
+                        });
+                    }
+                });
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -173,18 +257,36 @@ impl ExportDialog {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("Duration  {}", timestamp(project.duration())))
-                        .monospace()
-                        .color(MUTED),
+                    RichText::new(format!(
+                        "Duration  {}",
+                        timestamp(range.end.saturating_sub(range.start))
+                    ))
+                    .monospace()
+                    .color(MUTED),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let export =
                         egui::Button::new(RichText::new("Export video").strong().color(BACK))
                             .fill(ACCENT);
-                    if ui.add_enabled(self.destination.is_some(), export).clicked()
+                    if ui
+                        .add_enabled(valid_range && self.destination.is_some(), export)
+                        .clicked()
                         && let Some(path) = self.destination.clone()
                     {
-                        decision = Some(Decision::Render(path, self.settings));
+                        let title = if self.settings.format == Format::Gif {
+                            String::new()
+                        } else {
+                            self.title.trim().to_owned()
+                        };
+                        let cover_frame = (self.settings.format == Format::Mp4
+                            && self.include_cover)
+                            .then_some(self.cover_frame);
+                        decision = Some(Decision::Render(
+                            path,
+                            self.settings,
+                            range,
+                            ExportDetails { title, cover_frame },
+                        ));
                     }
                     if ui.button("Cancel").clicked() {
                         decision = Some(Decision::Cancel);
@@ -200,11 +302,28 @@ impl ExportDialog {
     }
 }
 
+fn range_boundary(ui: &mut egui::Ui, frame: &mut u32, duration: u32) {
+    let mut seconds = f64::from(*frame) / f64::from(FPS);
+    if ui
+        .add(
+            egui::DragValue::new(&mut seconds)
+                .range(0.0..=f64::from(duration) / f64::from(FPS))
+                .speed(1.0 / f64::from(FPS))
+                .fixed_decimals(2)
+                .suffix(" s"),
+        )
+        .changed()
+    {
+        *frame = (seconds * f64::from(FPS)).round() as u32;
+    }
+}
+
 fn format_name(format: Format) -> &'static str {
     match format {
         Format::Mp4 | Format::Preview => "MP4 · H.264",
         Format::Webm => "WebM · VP9",
         Format::Mkv => "MKV · Lossless",
+        Format::Gif => "Animated GIF",
     }
 }
 

@@ -99,6 +99,10 @@ impl Preview {
         self.wants_play
     }
 
+    pub fn is_output_active(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn status(&self) -> Option<&str> {
         if let Some((_, message)) = &self.failed {
             return Some(message);

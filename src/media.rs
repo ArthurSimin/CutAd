@@ -10,10 +10,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{File, read_to_string};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ pub enum Format {
     Mp4,
     Webm,
     Mkv,
+    Gif,
 }
 
 impl Format {
@@ -35,6 +36,7 @@ impl Format {
         match self {
             Self::Webm => "webm",
             Self::Mkv => "mkv",
+            Self::Gif => "gif",
             Self::Preview | Self::Mp4 => "mp4",
         }
     }
@@ -118,6 +120,7 @@ impl Format {
                 "-b:a",
                 "160k",
             ],
+            Self::Gif => vec!["-c:v", "gif", "-loop", "0"],
         }
     }
 }
@@ -151,20 +154,28 @@ pub struct Output {
     pub fps: u32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExportDetails {
+    pub title: String,
+    pub cover_frame: Option<u32>,
+}
+
 impl Output {
     pub fn new(format: Format) -> Self {
         Self {
             format,
             quality: Quality::Balanced,
-            short_edge: None,
-            fps: FPS,
+            short_edge: (format == Format::Gif).then_some(480),
+            fps: if format == Format::Gif { 15 } else { FPS },
         }
     }
 
     pub fn for_project(format: Format, project: &Project) -> Self {
         let mut output = Self::new(format);
         output.quality = Quality::High;
-        if let Some(source) = project.source_video() {
+        if format != Format::Gif
+            && let Some(source) = project.source_video()
+        {
             output.fps = match source.fps {
                 0..=21 => 30,
                 22..=24 => 24,
@@ -255,9 +266,11 @@ struct Layer<'a> {
     input: Option<usize>,
     mask_input: Option<usize>,
     font: Option<String>,
+    lut: Option<String>,
     seek: u32,
     start: u32,
     skip: u32,
+    history: u32,
     length: u32,
     transition: Option<Transition>,
 }
@@ -339,7 +352,7 @@ pub fn executable(name: &str) -> Result<PathBuf> {
         .with_context(|| format!("{name} is required. Install FFmpeg and add its tools to PATH."))
 }
 
-fn command(name: &str) -> Result<Command> {
+pub(crate) fn command(name: &str) -> Result<Command> {
     let mut command = Command::new(executable(name)?);
     command.stdin(Stdio::null());
     #[cfg(windows)]
@@ -348,6 +361,44 @@ fn command(name: &str) -> Result<Command> {
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     Ok(command)
+}
+
+/// Synthesize an editable audio asset from local text.
+pub fn synthesize_narration(text: &str, voice: &str, destination: &Path) -> Result<Asset> {
+    ensure!(
+        !text.trim().is_empty() && text.len() <= 4096,
+        "Choose a nonempty title up to 4096 bytes."
+    );
+    ensure!(!destination.exists(), "Choose a new WAV file.");
+    let destination = std::path::absolute(destination)?;
+    let parent = destination
+        .parent()
+        .context("Choose a folder for the narration.")?;
+    let scratch = tempfile::tempdir_in(parent)?;
+    let input = scratch.path().join("narration.txt");
+    let audio = scratch.path().join("narration.wav");
+    std::fs::write(&input, text)?;
+    let output = command("espeak-ng")
+        .context("Install eSpeak NG and put espeak-ng on PATH or beside CutAd.")?
+        .args(["-b", "1", "-v", voice, "-f"])
+        .arg(input)
+        .arg("-w")
+        .arg(&audio)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "eSpeak NG could not generate narration. {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut asset = probe(&audio)?;
+    tempfile::TempPath::try_from_path(audio)?.persist_noclobber(&destination)?;
+    asset.path = Some(destination.clone());
+    asset.label = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    Ok(asset)
 }
 
 pub fn probe(path: &Path) -> Result<Asset> {
@@ -484,16 +535,136 @@ pub fn render_with(
     cancel: &AtomicBool,
     progress: impl Fn(u8),
 ) -> Result<()> {
-    render_range(
+    render_timeline_section(
         project,
         destination,
         settings,
         0..project.duration(),
-        None,
-        RenderPass::Timeline,
         cancel,
         progress,
     )
+}
+
+/// Export a half-open range of 30 fps timeline ticks using the normal delivery settings.
+pub fn render_timeline_section(
+    project: &Project,
+    destination: &Path,
+    settings: Output,
+    range: Range<u32>,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<()> {
+    render_range(
+        project,
+        destination,
+        settings,
+        range,
+        None,
+        if settings.format == Format::Gif {
+            RenderPass::Gif(settings.fps)
+        } else {
+            RenderPass::Timeline
+        },
+        cancel,
+        progress,
+    )
+}
+
+/// Export delivery metadata and, for MP4, a thumbnail rendered from the timeline.
+pub fn render_with_details(
+    project: &Project,
+    destination: &Path,
+    settings: Output,
+    range: Range<u32>,
+    details: &ExportDetails,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<()> {
+    if details == &ExportDetails::default() {
+        return render_timeline_section(project, destination, settings, range, cancel, progress);
+    }
+    ensure!(
+        matches!(settings.format, Format::Mp4 | Format::Mkv | Format::Webm),
+        "Choose MP4, Matroska, or WebM for title metadata."
+    );
+    ensure!(
+        details.title.len() <= 2048 && !details.title.contains('\0'),
+        "Choose a shorter title without control characters."
+    );
+    ensure!(
+        details.cover_frame.is_none() || settings.format == Format::Mp4,
+        "Embedded covers require MP4."
+    );
+    render_range(
+        project,
+        destination,
+        settings,
+        range,
+        None,
+        RenderPass::Delivery(details),
+        cancel,
+        progress,
+    )
+}
+
+/// Detect hard cuts in source footage and return frame offsets within the supplied range.
+pub fn detect_scene_cuts(
+    path: &Path,
+    source: u32,
+    length: u32,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<Vec<u32>> {
+    const MAX_CUTS: usize = 1_000;
+    check_cancel(cancel)?;
+    if length < 2 {
+        return Ok(Vec::new());
+    }
+    let scratch = tempfile::tempdir()?;
+    let cuts = scratch.path().join("cuts");
+    let errors = scratch.path().join("errors");
+    let status = scratch.path().join("progress");
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg
+        .current_dir(scratch.path())
+        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+        .args(["-protocol_whitelist", "file", "-format_whitelist", DEMUXERS])
+        .args(["-ss", &seconds(source), "-t", &seconds(length), "-i"])
+        .arg(std::path::absolute(path)?)
+        .args([
+            "-map", "0:V:0", "-an", "-fps_mode", "passthrough",
+            "-vf",
+            &format!("setpts=PTS-STARTPTS,fps={FPS},trim=end_frame={length},scale=320:180:flags=area,\
+                 format=yuv420p,scdet=threshold=10:sc_pass=1,metadata=mode=print:key=lavfi.scd.time:file=cuts"),
+            "-frames:v", &(MAX_CUTS + 1).to_string(), "-f", "null", "-",
+        ])
+        .stdout(File::create(&status)?)
+        .stderr(File::create(&errors)?);
+    let mut child = ffmpeg.spawn()?;
+    if let Err(error) = wait_for_render(&mut child, &status, &errors, length, cancel, &progress, 60)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    check_cancel(cancel)?;
+    let raw = read_to_string(cuts)?;
+    let mut offsets = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("lavfi.scd.time=")?.parse::<f64>().ok())
+        .filter_map(|time| {
+            let frame = (time * f64::from(FPS)).round() as u32;
+            (frame > 0 && frame < length).then_some(frame)
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    offsets.dedup();
+    ensure!(
+        offsets.len() <= MAX_CUTS,
+        "Too many cuts. Trim the clip and scan a shorter section."
+    );
+    progress(100);
+    Ok(offsets)
 }
 
 /// Render the audible portion of a timeline range as 16 kHz mono PCM for transcription.
@@ -511,8 +682,9 @@ pub fn render_audio_mix(
         range,
         None,
         RenderPass::Audio {
-            sample_rate: 16_000,
+            sample_rate: crate::beats::SAMPLE_RATE,
             channels: 1,
+            format: AudioFormat::Wav,
         },
         cancel,
         progress,
@@ -526,6 +698,66 @@ pub fn render_audio_master(
     cancel: &AtomicBool,
     progress: impl Fn(u8),
 ) -> Result<()> {
+    export_audio(project, destination, AudioFormat::Wav, cancel, progress)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioFormat {
+    Wav,
+    Flac,
+    Mp3,
+}
+
+impl AudioFormat {
+    pub const ALL: [Self; 3] = [Self::Wav, Self::Flac, Self::Mp3];
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+            Self::Mp3 => "mp3",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wav => "WAV · PCM",
+            Self::Flac => "FLAC · Lossless",
+            Self::Mp3 => "MP3 · 320 kbps",
+        }
+    }
+
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let extension = path.extension().unwrap_or_default();
+        Self::ALL
+            .into_iter()
+            .find(|format| extension.eq_ignore_ascii_case(format.extension()))
+            .context("Choose a .wav, .flac, or .mp3 file.")
+    }
+
+    fn codec(self) -> &'static [&'static str] {
+        match self {
+            Self::Wav => &["-c:a", "pcm_s16le"],
+            Self::Flac => &[
+                "-c:a",
+                "flac",
+                "-sample_fmt",
+                "s32",
+                "-bits_per_raw_sample",
+                "24",
+            ],
+            Self::Mp3 => &["-c:a", "libmp3lame", "-b:a", "320k"],
+        }
+    }
+}
+
+pub fn export_audio(
+    project: &Project,
+    destination: &Path,
+    format: AudioFormat,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<()> {
     render_range(
         project,
         destination,
@@ -535,10 +767,918 @@ pub fn render_audio_master(
         RenderPass::Audio {
             sample_rate: SAMPLE_RATE,
             channels: 2,
+            format,
         },
         cancel,
         progress,
     )
+}
+
+fn isolated_clip_audio(clip: &Clip, asset: &Asset) -> Result<Project> {
+    ensure!(
+        asset.audio && !clip.freeze && !clip.slot,
+        "Select a clip with audio."
+    );
+    let mut clip = clip.clone();
+    clip.start = 0;
+    clip.gain = 1.0;
+    Ok(Project {
+        assets: vec![asset.clone()],
+        tracks: vec![crate::project::Track {
+            clips: vec![clip],
+            ..crate::project::Track::new("Clip audio", TrackKind::Audio)
+        }],
+        ..Project::default()
+    })
+}
+
+/// Analyze the selected clip locally and return a linear gain and its estimated LUFS.
+pub fn normalize_clip_loudness(
+    clip: &Clip,
+    asset: &Asset,
+    cancel: &AtomicBool,
+) -> Result<(f32, f64)> {
+    let project = isolated_clip_audio(clip, asset)?;
+    let length = clip.length;
+    let scratch = tempfile::tempdir()?;
+    let mix = scratch.path().join("mix.wav");
+    render_audio_master(&project, &mix, cancel, |_| {})?;
+    check_cancel(cancel)?;
+    let status = scratch.path().join("progress");
+    let analysis = scratch.path().join("loudness");
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-i",
+        ])
+        .arg(&mix)
+        .args([
+            "-af",
+            "loudnorm=I=-16:TP=-1.5:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdout(File::create(&status)?)
+        .stderr(File::create(&analysis)?);
+    let mut child = ffmpeg.spawn()?;
+    if let Err(error) = wait_for_render(&mut child, &status, &analysis, length, cancel, &|_| {}, 50)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    check_cancel(cancel)?;
+    let report = read_to_string(&analysis)?;
+    let start = report
+        .rfind('{')
+        .context("FFmpeg returned no loudness measurement.")?;
+    let metrics = serde_json::Deserializer::from_str(&report[start..])
+        .into_iter::<Value>()
+        .next()
+        .transpose()?
+        .context("No loudness measurement.")?;
+    let parse = |key: &str| {
+        metrics[key]
+            .as_str()
+            .and_then(|text| text.parse::<f64>().ok())
+            .filter(|reading| reading.is_finite())
+            .context("The clip is silent or too short to measure its loudness.")
+    };
+    let loudness = parse("input_i")?;
+    let true_peak = parse("input_tp")?;
+    let change_db = (-16.0 - loudness).min(-1.5 - true_peak);
+    let gain = 10.0_f64.powf(change_db / 20.0).min(4.0);
+    Ok((gain as f32, loudness + 20.0 * gain.log10()))
+}
+
+/// Find recurring beat positions in the selected clip's timeline range.
+pub fn detect_clip_beats(clip: &Clip, asset: &Asset, cancel: &AtomicBool) -> Result<Vec<u32>> {
+    ensure!(
+        clip.end() <= MAX_FRAMES,
+        "The clip is outside the timeline."
+    );
+    let project = isolated_clip_audio(clip, asset)?;
+    let scratch = tempfile::tempdir()?;
+    let source = scratch.path().join("beat-analysis.wav");
+    render_audio_mix(&project, &source, 0..clip.length, cancel, |_| {})?;
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(source)
+        .args(["-f", "s16le", "pipe:1"]);
+    let beats = cutout_pipe(&mut ffmpeg, scratch.path(), "Decode beat audio", |stream| {
+        crate::beats::detect(BufReader::new(stream), clip.length, cancel)
+    })?;
+    Ok(beats.into_iter().map(|tick| clip.start + tick).collect())
+}
+
+/// Write a reversed copy of the selected source span and return its fractional start.
+pub fn reverse_clip(
+    clip: &Clip,
+    asset: &Asset,
+    destination: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<(Asset, u8)> {
+    check_cancel(cancel)?;
+    ensure!(
+        !clip.freeze && !clip.slot && matches!(asset.kind, AssetKind::Video | AssetKind::Audio),
+        "Choose a video or audio clip to reverse."
+    );
+    let source = std::path::absolute(asset.path.as_ref().context("Relink the source first.")?)?;
+    let destination = std::path::absolute(destination)?;
+    ensure!(
+        !destination.exists() && !same_path(&source, &destination),
+        "Choose a new file for the reversed media."
+    );
+    let parent = destination
+        .parent()
+        .context("Choose a local file for the reversed media.")?;
+    let scratch = tempfile::tempdir_in(parent)?;
+    let first = clip.source_units_at(0);
+    let end = first + clip.source_duration_units();
+    let start_frame = u32::try_from(first / 100)?;
+    let end_frame = u32::try_from((end + 99) / 100)?;
+    ensure!(
+        start_frame < end_frame && end_frame <= asset.frames,
+        "The selected clip extends past the source."
+    );
+    let geometry = asset
+        .geometry
+        .or_else(|| probe(&source).ok().and_then(|media| media.geometry));
+    let video = asset.kind == AssetKind::Video;
+    let pixel_format = if video {
+        let result = command("ffprobe")?
+            .args([
+                "-v",
+                "error",
+                "-protocol_whitelist",
+                "file",
+                "-format_whitelist",
+                DEMUXERS,
+                "-select_streams",
+                "V:0",
+                "-show_entries",
+                "stream=pix_fmt",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&source)
+            .output()?;
+        let name = String::from_utf8_lossy(&result.stdout);
+        let name = name.trim();
+        match name {
+            "yuv420p" | "yuv422p" | "yuv444p" | "yuv420p10le" | "yuv422p10le" | "yuv444p10le"
+            | "yuv420p12le" | "yuv422p12le" | "yuv444p12le" | "yuva444p" => name.to_owned(),
+            "bgra" | "rgba" => "bgra".into(),
+            _ => "yuva444p".into(),
+        }
+    } else {
+        String::new()
+    };
+    let (rate, pixels) = geometry.map_or((FPS, 4096_u64 * 4096), |size| {
+        (
+            match size.fps {
+                0..=30 => 30,
+                31..=60 => 60,
+                _ => 120,
+            },
+            u64::from(size.width) * u64::from(size.height),
+        )
+    });
+    // Bound the buffers used by FFmpeg's reverse filters by encoding short chunks.
+    let chunk = if video {
+        (128 * 1024 * 1024 / (pixels.saturating_mul(8 * u64::from(rate / FPS))).max(1))
+            .clamp(1, 5 * u64::from(FPS)) as u32
+    } else {
+        15 * FPS
+    };
+    let mut last = end_frame;
+    let mut list = String::new();
+    let mut part = 0;
+    while last > start_frame {
+        let first = last.saturating_sub(chunk).max(start_frame);
+        let length = last - first;
+        let seek = if asset.preview_seek && asset.audio_offset_samples == 0 {
+            first.saturating_sub(FPS) / FPS * FPS
+        } else {
+            0
+        };
+        let filename = format!("part{part}.mkv");
+        let mut ffmpeg = command("ffmpeg")?;
+        ffmpeg
+            .current_dir(scratch.path())
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-nostats",
+                "-progress",
+                "pipe:1",
+                "-protocol_whitelist",
+                "file",
+                "-format_whitelist",
+                DEMUXERS,
+                "-ss",
+                &seconds(seek),
+                "-i",
+            ])
+            .arg(&source);
+        let audio_input = if seek > 0 && asset.audio {
+            ffmpeg
+                .args([
+                    "-protocol_whitelist",
+                    "file",
+                    "-format_whitelist",
+                    DEMUXERS,
+                    "-i",
+                ])
+                .arg(&source);
+            1
+        } else {
+            0
+        };
+        let mut graph = Vec::new();
+        if video {
+            let factor = rate / FPS;
+            let from = (first - seek) * factor;
+            let to = (last - seek) * factor;
+            graph.push(format!("[0:V:0]setpts=PTS-STARTPTS,fps={rate},format={pixel_format},trim=start_frame={from}:end_frame={to},reverse,settb=1/{rate},setpts=N[v]"));
+            ffmpeg.args(["-map", "[v]", "-c:v", "ffv1", "-threads:v", "2"]);
+        }
+        if asset.audio {
+            let source_offset = asset.audio_offset_samples;
+            let start = i64::from(first) * SAMPLES_PER_FRAME - source_offset.min(0);
+            let samples = i64::from(length) * SAMPLES_PER_FRAME;
+            let end = start + samples;
+            let delay = source_offset.max(0);
+            graph.push(format!("[{audio_input}:a:0]aresample={SAMPLE_RATE},asetpts=PTS-STARTPTS,adelay={delay}S:all=1,apad,atrim=start_sample={start}:end_sample={end},areverse,asetpts=N/SR/TB[a]"));
+            ffmpeg.args(["-map", "[a]", "-c:a", "flac"]);
+        }
+        ffmpeg.args([
+            "-filter_complex_threads",
+            "2",
+            "-filter_complex",
+            &graph.join(";"),
+            &filename,
+        ]);
+        run_media_preparation(&mut ffmpeg, scratch.path(), length, cancel, &|_| {})?;
+        list.push_str(&format!("file {filename}\nduration {}\n", seconds(length)));
+        last = first;
+        part += 1;
+        progress(((end_frame - last) as u64 * 95 / u64::from(end_frame - start_frame)) as u8);
+    }
+    std::fs::write(scratch.path().join("parts.txt"), list)?;
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg.current_dir(scratch.path()).args([
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-protocol_whitelist",
+        "file",
+        "-f",
+        "concat",
+        "-safe",
+        "1",
+        "-i",
+        "parts.txt",
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "reversed.mkv",
+    ]);
+    run_media_preparation(
+        &mut ffmpeg,
+        scratch.path(),
+        end_frame - start_frame,
+        cancel,
+        &|_| {},
+    )?;
+    let staged = scratch.path().join("reversed.mkv");
+    let mut reversed = probe(&staged)?;
+    ensure!(
+        reversed.frames >= end_frame - start_frame,
+        "Reversed media was shorter than the selected span."
+    );
+    check_cancel(cancel)?;
+    tempfile::TempPath::try_from_path(staged)?
+        .persist_noclobber(&destination)
+        .context("Could not save the new reversed media file.")?;
+    reversed.path = Some(destination.clone());
+    reversed.label = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    progress(100);
+    Ok((reversed, (i64::from(end_frame) * 100 - end) as u8))
+}
+
+/// Generate motion-compensated 120 fps footage without changing clip timing.
+pub fn interpolate_clip_motion(
+    clip: &Clip,
+    asset: &Asset,
+    destination: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<(Asset, u8)> {
+    prepare_clip_motion(clip, asset, destination, false, cancel, progress)
+}
+
+/// Stabilize camera shake while retaining the selected source span.
+pub fn stabilize_clip(
+    clip: &Clip,
+    asset: &Asset,
+    destination: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<(Asset, u8)> {
+    prepare_clip_motion(clip, asset, destination, true, cancel, progress)
+}
+
+fn prepare_clip_motion(
+    clip: &Clip,
+    asset: &Asset,
+    destination: &Path,
+    stabilize: bool,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<(Asset, u8)> {
+    check_cancel(cancel)?;
+    ensure!(
+        !clip.freeze && !clip.slot && asset.kind == AssetKind::Video,
+        "Choose a video clip for motion processing."
+    );
+    let source = std::path::absolute(asset.path.as_ref().context("Relink the source first.")?)?;
+    let destination = std::path::absolute(destination)?;
+    ensure!(
+        !destination.exists() && !same_path(&source, &destination),
+        "Choose a new file for the prepared media."
+    );
+    let geometry = asset
+        .geometry
+        .or_else(|| probe(&source).ok()?.geometry)
+        .context("The source has no video geometry.")?;
+    ensure!(
+        stabilize || geometry.fps < 120,
+        "Choose source footage below 120 fps."
+    );
+    let rate = if stabilize {
+        match geometry.fps {
+            0..=30 => 30,
+            31..=60 => 60,
+            _ => 120,
+        }
+    } else {
+        120
+    };
+    let pixel_format = command("ffprobe")?
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            DEMUXERS,
+            "-select_streams",
+            "V:0",
+            "-show_entries",
+            "stream=pix_fmt",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&source)
+        .output()?;
+    let format = String::from_utf8_lossy(&pixel_format.stdout);
+    ensure!(
+        pixel_format.status.success()
+            && matches!(
+                format.trim(),
+                "yuv420p"
+                    | "yuv422p"
+                    | "yuv444p"
+                    | "yuvj420p"
+                    | "yuvj422p"
+                    | "yuvj444p"
+                    | "rgb24"
+                    | "bgr24"
+                    | "rgb0"
+                    | "bgr0"
+                    | "0rgb"
+                    | "0bgr"
+                    | "gray"
+                    | "nv12"
+                    | "nv21"
+            ),
+        "Motion processing requires opaque 8-bit footage."
+    );
+    let first = clip.source_units_at(0);
+    let end = first + clip.source_duration_units();
+    let source_in = u32::try_from(first / 100)?;
+    let source_out = u32::try_from((end + 99) / 100)?;
+    ensure!(
+        source_in < source_out && source_out <= asset.frames,
+        "The clip extends past its source."
+    );
+    let factor = rate / FPS;
+    let start = source_in * factor;
+    let end = source_out * factor;
+    let length = source_out - source_in;
+    let parent = destination
+        .parent()
+        .context("Choose a local file for the prepared media.")?;
+    let scratch = tempfile::tempdir_in(parent)?;
+    let staged = scratch.path().join("prepared.mkv");
+    let seek = if asset.preview_seek && !asset.audio {
+        source_in.saturating_sub(FPS) / FPS * FPS
+    } else {
+        0
+    };
+    let start = start - seek * factor;
+    let end = end - seek * factor;
+    let motion_filter = if stabilize {
+        format!("fps={rate},deshake=rx=16:ry=16:edge=mirror:search=less:contrast=50")
+    } else {
+        format!("minterpolate=fps={rate}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+    };
+    let mut graph = format!(
+        "[0:V:0]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop=3,{motion_filter},trim=start_frame={start}:end_frame={end},settb=1/{rate},setpts=N[v]"
+    );
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            DEMUXERS,
+            "-ss",
+            &seconds(seek),
+            "-i",
+        ])
+        .arg(&source)
+        .args(["-map", "[v]", "-c:v", "ffv1", "-threads:v", "2"]);
+    if asset.audio {
+        let offset = asset.audio_offset_samples;
+        let start = i64::from(source_in) * SAMPLES_PER_FRAME - offset.min(0);
+        let end = start + i64::from(length) * SAMPLES_PER_FRAME;
+        let delay = offset.max(0);
+        graph.push_str(&format!(
+            ";[0:a:0]aresample={SAMPLE_RATE},adelay={delay}S:all=1,apad,atrim=start_sample={start}:end_sample={end},asetpts=N/SR/TB[a]"));
+        ffmpeg.args(["-map", "[a]", "-c:a", "flac"]);
+    }
+    ffmpeg
+        .args(["-filter_complex_threads", "2", "-filter_complex", &graph])
+        .arg(&staged);
+    run_media_preparation(&mut ffmpeg, scratch.path(), length, cancel, &progress)?;
+    let mut prepared = probe(&staged)?;
+    ensure!(
+        prepared.frames >= length,
+        "Prepared media was shorter than the selected span."
+    );
+    check_cancel(cancel)?;
+    tempfile::TempPath::try_from_path(staged)?
+        .persist_noclobber(&destination)
+        .context("Could not save the new media file.")?;
+    prepared.label = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    prepared.path = Some(destination);
+    progress(100);
+    Ok((prepared, (first % 100) as u8))
+}
+
+fn run_media_preparation(
+    command: &mut Command,
+    folder: &Path,
+    frames: u32,
+    cancel: &AtomicBool,
+    progress: &impl Fn(u8),
+) -> Result<()> {
+    check_cancel(cancel)?;
+    let status = folder.join("progress");
+    let errors = folder.join("errors");
+    let mut child = command
+        .stdout(File::create(&status)?)
+        .stderr(File::create(&errors)?)
+        .spawn()?;
+    if let Err(error) = wait_for_render(&mut child, &status, &errors, frames, cancel, progress, 50)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    check_cancel(cancel)
+}
+
+/// Create a local transparent copy, retaining the clip's source timing and audio.
+pub fn remove_background(
+    clip: &Clip,
+    asset: &Asset,
+    destination: &Path,
+    python: &Path,
+    model: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<(Asset, u8)> {
+    check_cancel(cancel)?;
+    let still = asset.kind == AssetKind::Image;
+    ensure!(
+        !clip.freeze && !clip.slot && (still || asset.kind == AssetKind::Video),
+        "Choose a video or image clip for background removal."
+    );
+    let source = std::path::absolute(asset.path.as_ref().context("Relink the source first.")?)?;
+    let destination = std::path::absolute(destination)?;
+    let model = std::path::absolute(model)?;
+    ensure!(model.is_file(), "Choose a local U²-Net ONNX model.");
+    ensure!(
+        !destination.exists() && !same_path(&source, &destination),
+        "Choose a new file for the cutout."
+    );
+    let extension = if still { "png" } else { "mkv" };
+    ensure!(
+        destination
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension)),
+        "Save the cutout as .{extension}."
+    );
+    let scratch = tempfile::tempdir_in(destination.parent().context("Choose an output folder.")?)?;
+    let staged = scratch.path().join(format!("cutout.{extension}"));
+    let first = if still { 0 } else { clip.source_units_at(0) };
+    let source_in = u32::try_from(first / 100)?;
+    let source_out = if still {
+        1
+    } else {
+        u32::try_from((first + clip.source_duration_units() + 99) / 100)?
+    };
+    ensure!(
+        source_in < source_out && source_out <= asset.frames,
+        "The clip extends past its source."
+    );
+    let length = source_out - source_in;
+    let rate = match asset.geometry.map(|geometry| geometry.fps) {
+        Some(31..=60) => 60,
+        Some(61..) => 120,
+        _ => FPS,
+    };
+    let factor = rate / FPS;
+    let expected = if still { 1 } else { length * factor };
+    // One PNG per frame carries its own dimensions and preserves existing source alpha.
+    let mut decode = command("ffmpeg")?;
+    decode
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            DEMUXERS,
+            "-i",
+        ])
+        .arg(&source)
+        .args(["-map", "0:V:0", "-filter_threads", "2"]);
+    if !still {
+        decode.args(["-vf", &format!(
+            "setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=0.1,fps={rate},trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS,scale=w='max(1,round(iw*sar))':h=ih:flags=lanczos,setsar=1",
+            source_in * factor, source_out * factor
+        )]);
+    }
+    decode.args([
+        "-frames:v",
+        &expected.to_string(),
+        "-c:v",
+        "png",
+        "-compression_level",
+        "1",
+        "-pix_fmt",
+        "rgba",
+        "-threads:v",
+        "1",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "image2pipe",
+        "pipe:1",
+    ]);
+    let mut infer = subject_model_command(python, &model, expected);
+    let mut encode = command("ffmpeg")?;
+    encode.args([
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-f",
+        "image2pipe",
+        "-framerate",
+        &rate.to_string(),
+        "-c:v",
+        "png",
+        "-i",
+        "pipe:0",
+    ]);
+    if asset.audio && !still {
+        encode
+            .args([
+                "-protocol_whitelist",
+                "file",
+                "-format_whitelist",
+                DEMUXERS,
+                "-i",
+            ])
+            .arg(&source);
+    }
+    encode.args(["-map", "0:v:0"]);
+    if still {
+        encode.args(["-frames:v", "1", "-update", "1"]);
+    } else {
+        encode.args(["-c:v", "ffv1", "-pix_fmt", "bgra", "-threads:v", "2"]);
+    }
+    if asset.audio && !still {
+        let offset = asset.audio_offset_samples;
+        let start = i64::from(source_in) * SAMPLES_PER_FRAME - offset.min(0);
+        let end = start + i64::from(length) * SAMPLES_PER_FRAME;
+        let delay = offset.max(0);
+        encode.args(["-map", "1:a:0", "-af", &format!(
+                "aresample={SAMPLE_RATE},adelay={delay}S:all=1,apad,atrim=start_sample={start}:end_sample={end},asetpts=N/SR/TB"
+            ), "-c:a", "flac"]);
+    }
+    encode.arg(&staged);
+    cutout_pipe(&mut decode, scratch.path(), "Decode", |decoded| {
+        infer.stdin(decoded);
+        cutout_pipe(&mut infer, scratch.path(), "Background model", |frames| {
+            encode.stdin(frames);
+            run_media_preparation(&mut encode, scratch.path(), length, cancel, &progress)
+        })
+    })?;
+    let mut prepared = probe(&staged)?;
+    ensure!(
+        prepared.frames >= length,
+        "The cutout was shorter than the selected span."
+    );
+    check_cancel(cancel)?;
+    tempfile::TempPath::try_from_path(staged)?
+        .persist_noclobber(&destination)
+        .context("Could not save the cutout file.")?;
+    prepared.label = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    prepared.path = Some(destination);
+    progress(100);
+    Ok((prepared, (first % 100) as u8))
+}
+
+/// Fit a source into the current canvas and suggest editable subject-following positions.
+pub fn reframe_subject(
+    clip: &Clip,
+    asset: &Asset,
+    canvas: [u32; 2],
+    python: &Path,
+    model: &Path,
+    cancel: &AtomicBool,
+) -> Result<(f32, crate::project::PositionAnimation)> {
+    check_cancel(cancel)?;
+    let still = asset.kind == AssetKind::Image;
+    ensure!(
+        !clip.slot && !clip.freeze && (still || asset.kind == AssetKind::Video),
+        "Choose a video or image clip for auto reframe."
+    );
+    ensure!(
+        clip.transform.rotation == 0.0
+            && clip.rotation_animation.is_empty()
+            && clip.framing == crate::project::Framing::default(),
+        "Reset rotation and crop before applying auto reframe."
+    );
+    ensure!(
+        canvas[0] > 0 && canvas[1] > 0 && clip.length > 0,
+        "Invalid canvas or clip length."
+    );
+    let source = asset.path.as_ref().context("Relink the source first.")?;
+    let model = std::path::absolute(model)?;
+    ensure!(model.is_file(), "Choose a local U²-Net ONNX model.");
+    let last = clip.length - 1;
+    let stride = last
+        .div_ceil(crate::project::MAX_POSITION_KEYS as u32 - 1)
+        .max(1);
+    let mut ticks: Vec<_> = if still {
+        vec![0]
+    } else {
+        (0..=last).step_by(stride as usize).collect()
+    };
+    if !still && ticks.last().copied() != Some(last) {
+        ticks.push(last);
+    }
+    let resize = "scale=w='max(1,min(320,round(iw*sar*min(1,320/max(iw*sar,ih)))))':h='max(1,round(ih*min(1,320/max(iw*sar,ih))))':flags=area,setsar=1";
+    let filter = if still {
+        resize.to_owned()
+    } else {
+        let source_us = clip.source_units_at(0) * 10_000 / i64::from(FPS);
+        let speed = f64::from(clip.speed_percent) / 100.0;
+        format!(
+            "settb=1/1000000,setpts=(PTS-STARTPTS-{source_us})/{speed:.2},tpad=stop_mode=clone:stop_duration=0.1,fps={FPS}:start_time=0,trim=end_frame={},select='not(mod(n,{stride}))+eq(n,{last})',{resize}",
+            clip.length
+        )
+    };
+    let scratch = tempfile::tempdir()?;
+    let mut decode = command("ffmpeg")?;
+    decode
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            DEMUXERS,
+            "-i",
+        ])
+        .arg(source)
+        .args([
+            "-map",
+            "0:V:0",
+            "-filter_threads",
+            "2",
+            "-vf",
+            &filter,
+            "-frames:v",
+            &ticks.len().to_string(),
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "png",
+            "-pix_fmt",
+            "rgba",
+            "-threads:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ]);
+    let mut infer = subject_model_command(python, &model, ticks.len() as u32);
+    infer.arg("subjects");
+    let result = cutout_pipe(&mut decode, scratch.path(), "Decode", |decoded| {
+        infer.stdin(decoded);
+        run_subject_analysis(&mut infer, scratch.path(), cancel)
+    })?;
+    let mut dimensions = [0.0_f32; 2];
+    let mut centers = Vec::with_capacity(ticks.len());
+    for result in result.lines() {
+        let values: Vec<f32> = result
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()?;
+        ensure!(
+            matches!(values.len(), 2 | 4),
+            "Invalid subject model output."
+        );
+        dimensions = [values[0], values[1]];
+        centers.push(values.get(2..4).map(|pair| [pair[0], pair[1]]));
+    }
+    ensure!(
+        centers.len() == ticks.len() && dimensions.iter().all(|n| *n > 0.0),
+        "Could not analyze the full clip."
+    );
+    ensure!(
+        centers.iter().any(Option::is_some),
+        "No foreground subject was detected."
+    );
+    if let Some(geometry) = asset.geometry {
+        dimensions = [geometry.width as f32, geometry.height as f32];
+    }
+    let canvas = canvas.map(|n| n as f32);
+    let ratios = [canvas[0] / dimensions[0], canvas[1] / dimensions[1]];
+    let fit = ratios[0].min(ratios[1]);
+    let fill = ratios[0].max(ratios[1]);
+    let scale = fill / fit;
+    ensure!(
+        scale <= crate::project::MAX_CLIP_SCALE,
+        "This aspect ratio needs a crop beyond the supported zoom."
+    );
+    let displayed = dimensions.map(|n| n * fill);
+    let mut framed = clip.clone();
+    framed.position_animation = Default::default();
+    let first = centers.iter().flatten().next().copied().unwrap_or([0.5; 2]);
+    let mut center = first;
+    for (tick, found) in ticks.into_iter().zip(centers) {
+        if let Some(found) = found {
+            center = std::array::from_fn(|axis| center[axis] * 0.25 + found[axis] * 0.75);
+        }
+        let position = std::array::from_fn(|axis| {
+            let reach = (displayed[axis] - canvas[axis]).max(0.0) * 0.5;
+            ((0.5 - center[axis]) * displayed[axis]).clamp(-reach, reach) / canvas[axis]
+        });
+        framed.set_position_keyframe(tick, position)?;
+    }
+    Ok((scale, framed.position_animation))
+}
+
+fn run_subject_analysis(
+    command: &mut Command,
+    folder: &Path,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    let output = folder.join("subjects.txt");
+    let errors = folder.join("subjects.log");
+    let mut child = command
+        .stdout(File::create(&output)?)
+        .stderr(File::create(&errors)?)
+        .spawn()
+        .context("Could not start Python for subject analysis.")?;
+    let finished = (|| loop {
+        check_cancel(cancel)?;
+        if let Some(status) = child.try_wait()? {
+            break Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    })();
+    let status = match finished {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if !status.success() {
+        let log = read_to_string(errors).unwrap_or_default();
+        let detail = log.lines().last().unwrap_or_default();
+        bail!("Subject analysis failed. {detail}");
+    }
+    Ok(read_to_string(output)?)
+}
+
+fn subject_model_command(python: &Path, model: &Path, frames: u32) -> Command {
+    let mut command = Command::new(python);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+        .env("OMP_NUM_THREADS", "2")
+        .env("NUMBA_DISABLE_JIT", "1")
+        .args(["-c", include_str!("cutout_worker.py")])
+        .arg(model)
+        .arg(frames.to_string());
+    command
+}
+
+fn cutout_pipe<T>(
+    command: &mut Command,
+    folder: &Path,
+    stage: &str,
+    consume: impl FnOnce(ChildStdout) -> Result<T>,
+) -> Result<T> {
+    let log = folder.join(format!("{stage}.log"));
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(File::create(&log)?)
+        .spawn()
+        .with_context(|| format!("Could not start {stage}."))?;
+    let output = child
+        .stdout
+        .take()
+        .context("Could not open the cutout pipeline.")?;
+    let result = consume(output);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        let diagnostic = read_to_string(&log).unwrap_or_default();
+        if let Some(summary) = diagnostic.lines().last().filter(|line| !line.is_empty()) {
+            bail!("{stage} failed. {summary}");
+        }
+    }
+    let value = result?;
+    ensure!(status.success(), "{stage} failed ({status}).");
+    Ok(value)
 }
 
 pub fn render_preview(
@@ -671,21 +1811,34 @@ fn composition_start(project: &Project, mut start: u32) -> u32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RenderPass {
+enum RenderPass<'a> {
     Timeline,
+    Delivery(&'a ExportDetails),
+    Gif(u32),
     Still,
     Png,
-    Audio { sample_rate: u32, channels: u8 },
+    Audio {
+        sample_rate: u32,
+        channels: u8,
+        format: AudioFormat,
+    },
 }
 
-impl RenderPass {
+impl RenderPass<'_> {
     fn is_still(self) -> bool {
         matches!(self, Self::Still | Self::Png)
+    }
+
+    fn wants_audio(self) -> bool {
+        matches!(
+            self,
+            Self::Timeline | Self::Delivery(_) | Self::Audio { .. }
+        )
     }
 }
 
 fn audible(clip: &Clip, asset: &Asset) -> bool {
-    !clip.freeze && asset.audio && clip.gain > 0.0
+    !clip.freeze && asset.audio && clip.has_audible_gain()
 }
 
 fn render_range(
@@ -694,17 +1847,24 @@ fn render_range(
     settings: Output,
     range: Range<u32>,
     preview: Option<PreviewQuality>,
-    pass: RenderPass,
+    pass: RenderPass<'_>,
     cancel: &AtomicBool,
     progress: impl Fn(u8),
 ) -> Result<()> {
     let format = settings.format;
     let still = pass.is_still();
     let audio_only = matches!(pass, RenderPass::Audio { .. });
-    ensure!(
-        matches!(settings.fps, 24 | 30 | 60 | 120),
-        "Choose 24, 30, 60, or 120 fps."
-    );
+    if format == Format::Gif {
+        ensure!(
+            matches!(settings.fps, 12 | 15 | 24 | 30),
+            "Choose 12, 15, 24, or 30 fps for GIF."
+        );
+    } else {
+        ensure!(
+            matches!(settings.fps, 24 | 30 | 60 | 120),
+            "Choose 24, 30, 60, or 120 fps."
+        );
+    }
     check_cancel(cancel)?;
     project.validate()?;
     ensure!(
@@ -713,7 +1873,7 @@ fn render_range(
     );
     ensure!(
         range.start < range.end && range.end <= project.duration(),
-        "Preview is outside the timeline."
+        "The render range is outside the timeline."
     );
     let [width, height] = preview.map_or_else(
         || settings.size(project),
@@ -726,7 +1886,9 @@ fn render_range(
         width,
         height,
         rate: settings.fps.max(FPS),
-        full_chroma: format == Format::Mkv || settings.quality == Quality::High || full_preview,
+        full_chroma: matches!(format, Format::Mkv | Format::Gif)
+            || settings.quality == Quality::High
+            || full_preview,
     };
     let origin = if audio_only {
         range.start
@@ -737,9 +1899,7 @@ fn render_range(
     let destination = std::path::absolute(destination)?;
     ensure!(
         project
-            .assets
-            .iter()
-            .filter_map(|asset| asset.path.as_deref())
+            .source_paths()
             .all(|path| !same_path(path, &destination)),
         "Choose an output separate from the original media."
     );
@@ -750,10 +1910,11 @@ fn render_range(
     let mut clips = Vec::new();
     let mut inputs = Vec::new();
     let mut staged_fonts = HashMap::new();
+    let mut staged_luts = HashMap::new();
     for track in project
         .tracks
         .iter()
-        .filter(|track| !track.muted && (!still || track.kind == TrackKind::Video))
+        .filter(|track| !track.muted && (pass.wants_audio() || track.kind == TrackKind::Video))
     {
         let mut ordered: Vec<_> = track.clips.iter().collect();
         ordered.sort_unstable_by_key(|clip| clip.start);
@@ -767,6 +1928,21 @@ fn render_range(
                 continue;
             }
             let skip = first - clip.start;
+            let active = || {
+                clip.effects
+                    .iter()
+                    .filter(|effect| effect.enabled && effect.amount != 0)
+            };
+            let preroll = active().filter(|effect| !effect.preset.audio()).try_fold(
+                0_u32,
+                |frames, effect| {
+                    effect
+                        .preset
+                        .visual_preroll()
+                        .map(|needed| frames.saturating_add(needed))
+                },
+            );
+            let history = preroll.unwrap_or(skip).min(skip);
             let asset = project
                 .asset(&clip.asset_id)
                 .context("Clip media is missing.")?;
@@ -801,15 +1977,16 @@ fn render_range(
                     && format == Format::Preview
                     && asset.preview_seek
                     && asset.kind == AssetKind::Video
-                    && !clip
-                        .effects
-                        .iter()
-                        .any(|effect| effect.enabled && effect.amount != 0)
+                    && clip.speed_percent == crate::project::NORMAL_SPEED
+                    && clip.source_subframe == 0
+                    && (still || clip.pitch_semitones == 0)
+                    && preroll.is_some()
+                    && !active().any(|effect| effect.preset.audio())
                 {
                     let first_frame = if clip.freeze {
                         clip.source
                     } else {
-                        clip.source + skip
+                        clip.source + skip - history
                     };
                     seek = first_frame.saturating_sub(FPS) / FPS * FPS;
                 }
@@ -832,6 +2009,35 @@ fn render_range(
             } else {
                 None
             };
+            let lut = if let Some(path) = clip
+                .color_lut
+                .as_ref()
+                .filter(|_| !audio_only && track.kind == TrackKind::Video)
+            {
+                if let Some(existing) = staged_luts.get(path) {
+                    Some(String::clone(existing))
+                } else {
+                    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+                    let filename = format!("look{}.cube", staged_luts.len());
+                    let metadata = path
+                        .metadata()
+                        .with_context(|| format!("Relink the color LUT {}.", path.display()))?;
+                    ensure!(
+                        metadata.is_file() && metadata.len() <= MAX_BYTES,
+                        "Choose a .cube LUT up to 16 MiB."
+                    );
+                    let mut file = File::open(path)?.take(MAX_BYTES + 1);
+                    let bytes = std::io::copy(
+                        &mut file,
+                        &mut File::create(folder.path().join(&filename))?,
+                    )?;
+                    ensure!(bytes <= MAX_BYTES, "Choose a .cube LUT up to 16 MiB.");
+                    staged_luts.insert(path.clone(), filename.clone());
+                    Some(filename)
+                }
+            } else {
+                None
+            };
             clips.push(Layer {
                 kind: track.kind,
                 clip,
@@ -839,9 +2045,11 @@ fn render_range(
                 input,
                 mask_input,
                 font,
+                lut,
                 seek,
                 start: first - origin,
                 skip,
+                history,
                 length: last - first,
                 transition,
             });
@@ -864,10 +2072,10 @@ fn render_range(
         filter_graph(raster, &clips, range.end - origin, skipped, pass),
     )?;
     let suffix = match pass {
-        RenderPass::Timeline => format.extension(),
+        RenderPass::Timeline | RenderPass::Delivery(_) | RenderPass::Gif(_) => format.extension(),
         RenderPass::Still => "rgb",
         RenderPass::Png => "png",
-        RenderPass::Audio { .. } => "wav",
+        RenderPass::Audio { format, .. } => format.extension(),
     };
     let output = tempfile::Builder::new()
         .suffix(&format!(".{suffix}"))
@@ -905,6 +2113,20 @@ fn render_range(
             ])
             .arg(path);
     }
+    let artwork = if let RenderPass::Delivery(ExportDetails {
+        cover_frame: Some(frame),
+        ..
+    }) = pass
+    {
+        let cover = folder.path().join("cover.png");
+        export_frame_png(project, &cover, *frame, cancel)?;
+        ffmpeg
+            .args(["-f", "png_pipe", "-protocol_whitelist", "file", "-i"])
+            .arg(cover);
+        Some(inputs.len())
+    } else {
+        None
+    };
     ffmpeg.arg("-/filter_complex").arg(graph);
     if !audio_only {
         ffmpeg.args(["-map", "[video]"]);
@@ -912,19 +2134,20 @@ fn render_range(
     if let RenderPass::Audio {
         sample_rate,
         channels,
+        format,
     } = pass
     {
-        ffmpeg.args([
-            "-map",
-            "[audio]",
-            "-vn",
-            "-c:a",
-            "pcm_s16le",
-            "-ac",
-            &channels.to_string(),
-            "-ar",
-            &sample_rate.to_string(),
-        ]);
+        ffmpeg
+            .args([
+                "-map",
+                "[audio]",
+                "-vn",
+                "-ac",
+                &channels.to_string(),
+                "-ar",
+                &sample_rate.to_string(),
+            ])
+            .args(format.codec());
     } else if still {
         ffmpeg.args([
             "-frames:v",
@@ -940,6 +2163,8 @@ fn render_range(
         } else {
             ffmpeg.args(["-f", "rawvideo"]);
         }
+    } else if matches!(pass, RenderPass::Gif(_)) {
+        ffmpeg.args(format.codecs(settings.quality, full_preview));
     } else {
         ffmpeg
             .args([
@@ -949,10 +2174,29 @@ fn render_range(
                 &seconds(frames),
                 "-threads",
                 "4",
-                "-r",
+                "-r:v:0",
                 &settings.fps.to_string(),
             ])
             .args(format.codecs(settings.quality, full_preview));
+    }
+    if let RenderPass::Delivery(details) = pass
+        && !details.title.is_empty()
+    {
+        ffmpeg
+            .arg("-metadata")
+            .arg(format!("title={}", details.title));
+    }
+    if let Some(artwork) = artwork {
+        ffmpeg.args([
+            "-map",
+            &format!("{artwork}:v:0"),
+            "-c:v:1",
+            "png",
+            "-pix_fmt:v:1",
+            "rgb24",
+            "-disposition:v:1",
+            "attached_pic",
+        ]);
     }
     ffmpeg
         .arg(output.as_os_str())
@@ -1029,10 +2273,10 @@ fn filter_graph(
     clips: &[Layer<'_>],
     frames: u32,
     skip: u32,
-    pass: RenderPass,
+    pass: RenderPass<'_>,
 ) -> String {
-    let still = pass.is_still();
     let audio_only = matches!(pass, RenderPass::Audio { .. });
+    let wants_audio = pass.wants_audio();
     let Raster {
         width,
         height,
@@ -1052,7 +2296,7 @@ fn filter_graph(
     }
     let mut video = "base".to_owned();
     let mut audio = vec!["[silence]".to_owned()];
-    if !still {
+    if wants_audio {
         graph.push(format!(
             "anullsrc=r={SAMPLE_RATE}:cl=stereo,atrim=end_sample={samples}[silence]"
         ));
@@ -1079,7 +2323,7 @@ fn filter_graph(
         };
         if !audio_only && layer.kind == TrackKind::Video {
             let video_fx = effects(false);
-            let history = if video_fx.is_empty() { 0 } else { layer.skip };
+            let history = layer.history;
             let source_offset = layer.skip - history;
             let needed = layer.length + history;
             let mut source = if let Some(title) = &asset.title {
@@ -1093,6 +2337,17 @@ fn filter_graph(
                 )
             } else {
                 let input = layer.input.expect("media input");
+                let retimed =
+                    clip.speed_percent != crate::project::NORMAL_SPEED || clip.source_subframe != 0;
+                let video_clock = if retimed {
+                    let source_us = clip.source_units_at(0) * 10_000 / i64::from(FPS);
+                    let speed = f64::from(clip.speed_percent) / 100.0;
+                    format!(
+                        "settb=1/1000000,setpts=(PTS-STARTPTS-{source_us})/{speed:.2},fps={rate}:start_time=0"
+                    )
+                } else {
+                    format!("setpts=PTS-STARTPTS,fps={rate}")
+                };
                 let timing = if clip.freeze {
                     let start = (clip.source - layer.seek) * factor;
                     let end = start + 1;
@@ -1102,7 +2357,9 @@ fn filter_graph(
                              settb=1/{rate},setpts=N,tpad=stop_mode=clone:stop={frames}"
                     )
                 } else {
-                    let offset = if asset.kind == AssetKind::Image {
+                    let offset = if retimed {
+                        source_offset
+                    } else if asset.kind == AssetKind::Image {
                         0
                     } else {
                         clip.source + source_offset - layer.seek
@@ -1119,8 +2376,9 @@ fn filter_graph(
                         seconds(pad)
                     )
                 };
+                let framing = framing_filters(clip.framing);
                 format!(
-                    "[{input}:V:0]setpts=PTS-STARTPTS,fps={rate},{timing},settb=1/{rate},setpts=N,\
+                    "[{input}:V:0]{video_clock},{timing},settb=1/{rate},setpts=N{framing},\
                          scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1:flags=lanczos,\
                          setsar=1,format={alpha},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"
                 )
@@ -1147,6 +2405,19 @@ fn filter_graph(
                     ",format={alpha},eq=brightness={brightness:.3}:contrast={contrast:.3}:saturation={saturation:.3}"
                 ));
             }
+            for ((_, channel), range) in crate::project::HUE_RANGES
+                .into_iter()
+                .zip(clip.hue_adjustments)
+            {
+                if range != crate::project::HueAdjustment::default() {
+                    let saturation = f64::from(range.saturation) / 100.0;
+                    let intensity = f64::from(range.intensity) / 100.0;
+                    source.push_str(&format!(",format=rgba,huesaturation=colors={channel}:hue={}:saturation={saturation:.2}:intensity={intensity:.2}", range.hue));
+                }
+            }
+            if let Some(lut) = &layer.lut {
+                source.push_str(&format!(",format=rgba,lut3d=file={lut}:interp=tetrahedral"));
+            }
             source.push_str(&video_fx);
             if history != 0 {
                 let history = history * factor;
@@ -1166,9 +2437,15 @@ fn filter_graph(
                 source = format!("[masked{index}]null");
             }
             append_visual_fades(&mut source, layer, raster);
+            if !clip.opacity_animation.is_empty() {
+                append_opacity_animation(&mut graph, &mut source, layer, index, raster);
+            }
             let start = layer.start * factor;
-            let end = start + layer.length * factor;
-            if clip.transform == Transform::default() && clip.position_animation.is_empty() {
+            if clip.transform == Transform::default()
+                && clip.position_animation.is_empty()
+                && clip.rotation_animation.is_empty()
+                && clip.scale_animation.is_empty()
+            {
                 graph.push(format!("{source},setsar=1,format={alpha},settb=1/{rate},setpts=N+{start}[visual{index}]"));
             } else {
                 transformed_layer(&mut graph, &source, layer, index, raster);
@@ -1176,21 +2453,29 @@ fn filter_graph(
             if let Some(transition) = layer.transition.filter(|_| clip.length > 1) {
                 video = transition_layer(&mut graph, &video, index, layer, transition, raster);
             } else {
-                graph.push(overlay(
+                compose_layer(
+                    &mut graph,
                     &video,
-                    &format!("visual{index}"),
                     &format!("layer{index}"),
-                    start,
-                    end,
+                    index,
+                    layer,
                     raster,
-                ));
+                );
                 video = format!("layer{index}");
             }
         }
-        if !still
+        if wants_audio
             && let Some(input) = layer.input
             && audible(clip, asset)
         {
+            if clip.speed_percent != crate::project::NORMAL_SPEED
+                || clip.source_subframe != 0
+                || clip.pitch_semitones != 0
+            {
+                retimed_audio(&mut graph, layer, index, input, &effects(true));
+                audio.push(format!("[sound{index}]"));
+                continue;
+            }
             let source_start =
                 i64::from(clip.source) * SAMPLES_PER_FRAME - asset.audio_offset_samples;
             let window_skip = i64::from(layer.skip) * SAMPLES_PER_FRAME;
@@ -1212,20 +2497,28 @@ fn filter_graph(
                     format!(",atrim=start_sample={post_trim},asetpts=PTS-STARTPTS")
                 };
                 let fade = audio_fade_filter(clip, from.max(0) - source_start, end - source_start);
+                let gain = audio_gain_filter(clip, from.max(0) - source_start);
+                let channels = channel_filter(clip);
                 graph.push(format!("[{input}:a:0]aresample={SAMPLE_RATE},atrim=start_sample={}:end_sample={},\
-                    asetpts=PTS-STARTPTS,aformat=channel_layouts=stereo,volume={:.5}{fx}{fade}{final_trim},adelay={delay}S:all=1[sound{index}]",
-                    from.max(0) - seek, end - seek, clip.gain));
+                    asetpts=PTS-STARTPTS,aformat=channel_layouts=stereo{channels}{gain}{fx}{fade}{final_trim},adelay={delay}S:all=1[sound{index}]",
+                    from.max(0) - seek, end - seek));
                 audio.push(format!("[sound{index}]"));
             }
         }
     }
-    if !audio_only {
+    if let RenderPass::Gif(fps) = pass {
+        graph.extend([
+            format!("[{video}]trim=start_frame={},settb=1/{rate},setpts=N,fps={fps}:eof_action=pass,format=rgb24,split[gifframes][gifcolors]", skip * factor),
+            "[gifcolors]palettegen=stats_mode=single[gifpalette]".into(),
+            "[gifframes][gifpalette]paletteuse=new=1:dither=sierra2_4a[video]".into(),
+        ]);
+    } else if !audio_only {
         graph.push(format!(
             "[{video}]trim=start_frame={},settb=1/{rate},setpts=N,format={opaque}[video]",
             skip * factor
         ));
     }
-    if !still {
+    if wants_audio {
         let skip_samples = i64::from(skip) * SAMPLES_PER_FRAME;
         graph.push(format!("{}amix=inputs={}:duration=first:normalize=0,\
             alimiter=limit=0.95:level=0:latency=1,atrim=start_sample={skip_samples}:end_sample={samples},asetpts=PTS-STARTPTS[audio]",
@@ -1234,6 +2527,72 @@ fn filter_graph(
     graph.join(
         ";
 ",
+    )
+}
+
+fn retimed_audio(
+    graph: &mut Vec<String>,
+    layer: &Layer<'_>,
+    index: usize,
+    input: usize,
+    effects: &str,
+) {
+    let clip = layer.clip;
+    let source_start =
+        clip.source_units_at(0) * (SAMPLES_PER_FRAME / 100) - layer.asset.audio_offset_samples;
+    let pre_silence = (-source_start).max(0);
+    let pitch = 2.0_f64.powf(f64::from(clip.pitch_semitones) / 12.0);
+    let pitch_rate = (f64::from(SAMPLE_RATE) * pitch).round() as u32;
+    let mut speed =
+        f64::from(clip.speed_percent) / 100.0 * f64::from(SAMPLE_RATE) / f64::from(pitch_rate);
+    let mut tempo = String::new();
+    if pitch_rate != SAMPLE_RATE {
+        tempo.push_str(&format!(",asetrate={pitch_rate},aresample={SAMPLE_RATE}"));
+    }
+    while speed < 0.5 {
+        tempo.push_str(",atempo=0.5");
+        speed *= 2.0;
+    }
+    while speed > 2.0 {
+        tempo.push_str(",atempo=2.0");
+        speed /= 2.0;
+    }
+    if speed != 1.0 {
+        tempo.push_str(&format!(",atempo={speed:.4}"));
+    }
+    let window_start = i64::from(layer.skip) * SAMPLES_PER_FRAME;
+    let window_end = window_start + i64::from(layer.length) * SAMPLES_PER_FRAME;
+    let delay = i64::from(layer.start) * SAMPLES_PER_FRAME;
+    let fade = audio_fade_filter(clip, 0, window_end);
+    let gain = audio_gain_filter(clip, 0);
+    let channels = channel_filter(clip);
+    graph.push(format!(
+        "[{input}:a:0]aresample={SAMPLE_RATE},atrim=start_sample={},asetpts=PTS-STARTPTS,\
+         aformat=channel_layouts=stereo{channels},adelay={pre_silence}S:all=1{tempo},apad,atrim=end_sample={window_end}\
+         {gain}{effects}{fade},atrim=start_sample={window_start},asetpts=PTS-STARTPTS,\
+         adelay={delay}S:all=1[sound{index}]",
+        source_start.max(0)
+    ));
+}
+
+fn channel_filter(clip: &Clip) -> String {
+    use crate::project::AudioChannels;
+    if clip.audio_channels == AudioChannels::Stereo && clip.audio_balance == 0 {
+        return String::new();
+    }
+    let balance = f32::from(clip.audio_balance) / 100.0;
+    let left = 1.0 - balance.max(0.0);
+    let right = 1.0 + balance.min(0.0);
+    let channel = |side, volume| match clip.audio_channels {
+        AudioChannels::Stereo => format!("{volume:.4}*c{side}"),
+        AudioChannels::Mono => format!("{:.4}*c0+{:.4}*c1", volume * 0.5, volume * 0.5),
+        AudioChannels::Left => format!("{volume:.4}*c0"),
+        AudioChannels::Right => format!("{volume:.4}*c1"),
+    };
+    format!(
+        ",pan=stereo|c0={}|c1={}",
+        channel(0, left),
+        channel(1, right)
     )
 }
 
@@ -1258,6 +2617,16 @@ fn audio_fade_filter(clip: &Clip, first_sample: i64, end_sample: i64) -> String 
     } else {
         format!(",aeval='val(ch){gain}':c=same")
     }
+}
+
+fn audio_gain_filter(clip: &Clip, first_sample: i64) -> String {
+    let animation = &clip.gain_animation;
+    if animation.is_empty() {
+        return format!(",volume={:.5}", clip.gain);
+    }
+    let first = first_sample + i64::from(animation.offset) * SAMPLES_PER_FRAME;
+    let gain = scalar_expression(animation, &format!("((n+({first}))/{SAMPLES_PER_FRAME})"));
+    format!(",aeval='val(ch)*({gain})':c=same")
 }
 
 fn ink(rgb: [u8; 3]) -> String {
@@ -1423,6 +2792,31 @@ fn title_source(
     passes.join(",")
 }
 
+fn framing_filters(framing: crate::project::Framing) -> String {
+    let mut filters = String::new();
+    if framing.flip_horizontal {
+        filters.push_str(",hflip");
+    }
+    if framing.flip_vertical {
+        filters.push_str(",vflip");
+    }
+    let crate::project::Framing {
+        left,
+        right,
+        top,
+        bottom,
+        ..
+    } = framing;
+    if left != 0 || right != 0 || top != 0 || bottom != 0 {
+        let width = 100 - left - right;
+        let height = 100 - top - bottom;
+        filters.push_str(&format!(
+            ",crop=w='max(1,iw*{width}/100)':h='max(1,ih*{height}/100)':x=iw*{left}/100:y=ih*{top}/100:exact=1"
+        ));
+    }
+    filters
+}
+
 fn append_visual_fades(source: &mut String, layer: &Layer<'_>, raster: Raster) {
     let fade = layer.clip.visual_fade;
     if fade.is_empty() {
@@ -1470,12 +2864,71 @@ fn position_expression(layer: &Layer<'_>, axis: usize, dimension: usize) -> Stri
         let start = pixel(a.position[axis]);
         let difference = pixel(b.position[axis]) - start;
         let span = b.frame - a.frame;
+        let fraction = format!("(max(0,({tick}-({})))/{span})", a.frame);
+        let progress = easing_expression(clip.position_animation.easing, fraction);
         expression = format!(
-            "if(lt({tick},{}),{start:.6}+({difference:.6})*max(0,({tick}-({}))/{span}),{expression})",
-            b.frame, a.frame
+            "if(lt({tick},{}),{start:.6}+({difference:.6})*{progress},{expression})",
+            b.frame
         );
     }
     format!("round({expression})")
+}
+
+fn easing_expression(easing: crate::project::Easing, fraction: String) -> String {
+    match easing {
+        crate::project::Easing::Linear => fraction,
+        crate::project::Easing::EaseIn => format!("pow({fraction},2)"),
+        crate::project::Easing::EaseOut => format!("(1-pow(1-{fraction},2))"),
+        crate::project::Easing::EaseInOut => format!("(pow({fraction},2)*(3-2*{fraction}))"),
+        crate::project::Easing::Hold => "0".into(),
+    }
+}
+
+fn scalar_expression(animation: &crate::project::ScalarAnimation, tick: &str) -> String {
+    let mut expression = format!("{:.6}", animation.keys.last().unwrap().value);
+    for pair in animation.keys.windows(2).rev() {
+        let (a, b) = (pair[0], pair[1]);
+        let delta = b.value - a.value;
+        let span = b.frame - a.frame;
+        let fraction = format!("(max(0,{tick}-({}))/{span})", a.frame);
+        let progress = easing_expression(animation.easing, fraction);
+        expression = format!(
+            "if(lt({tick},{}),{:.6}+({delta:.6})*{progress},{expression})",
+            b.frame, a.value
+        );
+    }
+    expression
+}
+
+fn append_opacity_animation(
+    graph: &mut Vec<String>,
+    source: &mut String,
+    layer: &Layer<'_>,
+    index: usize,
+    raster: Raster,
+) {
+    let animation = &layer.clip.opacity_animation;
+    let factor = raster.rate / FPS;
+    let skip = i64::from(layer.skip) + i64::from(animation.offset);
+    let expression = scalar_expression(animation, &format!("(N/{factor}+({skip}))"));
+    let Raster {
+        width,
+        height,
+        rate,
+        ..
+    } = raster;
+    let alpha = raster.alpha();
+    let duration = seconds(layer.length);
+    // Compute the animated alpha on a tiny matte and expand it before multiplying the original alpha.
+    graph.extend([
+        format!("{source},format={alpha},settb=1/{rate},setpts=N,split=2[opacitybase{index}][opacitysrc{index}]"),
+        format!("[opacitysrc{index}]alphaextract[opacityoriginal{index}]"),
+        format!("nullsrc=s=2x2:r={rate}:d={duration},format=gray,geq=lum='round(255*({expression}))',\
+                 scale={width}:{height}:flags=neighbor,settb=1/{rate},setpts=N[opacitycurve{index}]"),
+        format!("[opacityoriginal{index}][opacitycurve{index}]blend=all_mode=multiply[opacitymask{index}]"),
+        format!("[opacitybase{index}][opacitymask{index}]alphamerge[opacitylayer{index}]"),
+    ]);
+    *source = format!("[opacitylayer{index}]null");
 }
 
 fn transformed_layer(
@@ -1493,15 +2946,46 @@ fn transformed_layer(
     } = raster;
     let alpha = raster.alpha();
     let transform = layer.clip.transform;
-    let scale = transform.scale;
     let angle = f64::from(transform.rotation).to_radians();
+    let rotation = &layer.clip.rotation_animation;
+    let rotate = if rotation.is_empty() {
+        format!(
+            "rotate={angle:.7}:ow='ceil(rotw({angle:.7})/2)*2':oh='ceil(roth({angle:.7})/2)*2':c=black@0"
+        )
+    } else {
+        let offset = i64::from(layer.skip) + i64::from(rotation.offset);
+        let expression = scalar_expression(rotation, &format!("(t*{FPS}+({offset}))"));
+        let bounds = "ceil(hypot(iw,ih)/2)*2";
+        format!("rotate='({expression})*PI/180':ow='{bounds}':oh='{bounds}':c=black@0")
+    };
     let x = position_expression(layer, 0, w);
     let y = position_expression(layer, 1, h);
-    let width = (((w as f32 * scale).round() as usize) & !1).max(2);
-    let height = (((h as f32 * scale).round() as usize) & !1).max(2);
-    let opacity = transform.opacity;
-    graph.push(format!("{source},format=rgba,scale={width}:{height}:flags=lanczos,\
-        rotate={angle:.7}:ow='ceil(rotw({angle:.7})/2)*2':oh='ceil(roth({angle:.7})/2)*2':c=black@0,\
+    let scale = &layer.clip.scale_animation;
+    let maximum = scale
+        .keys
+        .iter()
+        .map(|key| key.value)
+        .reduce(f32::max)
+        .unwrap_or(transform.scale);
+    let width = (((w as f64 * f64::from(maximum)).round() as usize) & !1).max(2);
+    let height = (((h as f64 * f64::from(maximum)).round() as usize) & !1).max(2);
+    let resize = if scale.is_empty() {
+        format!("scale={width}:{height}:flags=lanczos")
+    } else {
+        let offset = i64::from(layer.skip) + i64::from(scale.offset);
+        let expression = scalar_expression(scale, &format!("(t*{FPS}+({offset}))"));
+        format!(
+            "scale=w='min({width},max(2,2*trunc((iw*({expression})+0.5)/2)))':\
+            h='min({height},max(2,2*trunc((ih*({expression})+0.5)/2)))':eval=frame:flags=lanczos,\
+            pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0:eval=frame"
+        )
+    };
+    let opacity = if layer.clip.opacity_animation.is_empty() {
+        transform.opacity
+    } else {
+        1.0
+    };
+    graph.push(format!("{source},format=rgba,settb=1/{rate},setpts=N,{resize},{rotate},\
         colorchannelmixer=aa={opacity:.5},setsar=1,format={alpha},settb=1/{rate},setpts=N[shape{index}]"));
     graph.push(format!(
         "color=c=black@0:s={w}x{h}:r={rate}:d={},format={alpha}[clear{index}]",
@@ -1526,6 +3010,34 @@ fn overlay(
     )
 }
 
+fn compose_layer(
+    graph: &mut Vec<String>,
+    background: &str,
+    output: &str,
+    index: usize,
+    layer: &Layer<'_>,
+    raster: Raster,
+) {
+    let factor = raster.rate / FPS;
+    let start = layer.start * factor;
+    let end = start + layer.length * factor;
+    let visual = format!("visual{index}");
+    let Some(mode) = layer.clip.blend_mode.filter() else {
+        graph.push(overlay(background, &visual, output, start, end, raster));
+        return;
+    };
+    graph.extend([
+        format!("[{background}]split=2[blendbase{index}][blendcolor{index}]"),
+        format!("[{visual}]split=2[blendinput{index}][blendalpha{index}]"),
+        format!("[blendalpha{index}]alphaextract[blendmask{index}]"),
+        format!("[blendinput{index}]format=gbrp[blendfg{index}]"),
+        format!("[blendcolor{index}]format=gbrp[blendbg{index}]"),
+        format!("[blendbg{index}][blendfg{index}]blend=all_mode={mode}:eof_action=pass:repeatlast=0,format=gbrap[blendrgb{index}]"),
+        format!("[blendrgb{index}][blendmask{index}]alphamerge[blended{index}]"),
+        overlay(&format!("blendbase{index}"), &format!("blended{index}"), output, start, end, raster),
+    ]);
+}
+
 fn transition_layer(
     graph: &mut Vec<String>,
     background: &str,
@@ -1541,12 +3053,20 @@ fn transition_layer(
     let frames = duration * factor;
     let start_tail = start - 1;
     let cross_length = frames + 1;
-    let end = start + layer.length * factor;
+    graph.push(format!(
+        "[{background}]split=2[base{index}][previous{index}]"
+    ));
+    compose_layer(
+        graph,
+        &format!("base{index}"),
+        &format!("scene{index}"),
+        index,
+        layer,
+        raster,
+    );
     graph.extend([
-        format!("[{background}]split=2[base{index}][previous{index}]"),
         format!("[previous{index}]trim=start_frame={start_tail}:end_frame={start},\
                  settb=1/{rate},setpts=N,format=yuv444p,tpad=stop_mode=clone:stop={frames}[from{index}]"),
-        overlay(&format!("base{index}"), &format!("visual{index}"), &format!("scene{index}"), start, end, raster),
         format!("[scene{index}]split=2[full{index}][incoming{index}]"),
         format!("[incoming{index}]trim=start_frame={start}:end_frame={},settb=1/{rate},\
                  setpts=N,format=yuv444p,tpad=stop_mode=clone:stop=1[to{index}]", start + cross_length),
@@ -1588,6 +3108,137 @@ pub fn monitor_frame(path: &Path, frame: u32, size: [usize; 2]) -> Result<Vec<u8
         "Could not read this preview frame."
     );
     Ok(result.stdout)
+}
+
+#[derive(Clone, Copy)]
+struct ShotTone {
+    shadows: f64,
+    highlights: f64,
+    saturation: f64,
+}
+
+fn shot_tone(asset: &Asset, frame: u32) -> Result<ShotTone> {
+    ensure!(
+        matches!(asset.kind, AssetKind::Image | AssetKind::Video),
+        "Choose a video or image to analyze."
+    );
+    let path = asset
+        .path
+        .as_ref()
+        .context("Relink the clip before analyzing it.")?;
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg.args([
+        "-v",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        DEMUXERS,
+    ]);
+    if asset.kind == AssetKind::Video {
+        ffmpeg.args(["-ss", &seconds(frame.min(asset.frames.saturating_sub(1)))]);
+    }
+    let output = ffmpeg
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-map",
+            "0:V:0",
+            "-frames:v",
+            "1",
+            "-filter_threads",
+            "1",
+            "-vf",
+            "scale=160:160:force_original_aspect_ratio=decrease",
+            "-threads:v",
+            "1",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Could not read the source frame. {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut histogram = [0_u32; 256];
+    let mut saturation = 0.0;
+    let mut count = 0;
+    for pixel in output
+        .stdout
+        .chunks_exact(4)
+        .filter(|pixel| pixel[3] >= 128)
+    {
+        let [r, g, b] = [pixel[0], pixel[1], pixel[2]].map(u32::from);
+        let luma = (54 * r + 183 * g + 19 * b + 128) >> 8;
+        histogram[luma as usize] += 1;
+        saturation += f64::from(r.max(g).max(b) - r.min(g).min(b)) / 255.0;
+        count += 1;
+    }
+    ensure!(count > 0, "The source frame has no visible pixels.");
+    let percentile = |percent: u32| {
+        let rank = (count * percent / 100).max(1);
+        let mut total = 0;
+        histogram
+            .iter()
+            .position(|n| {
+                total += n;
+                total >= rank
+            })
+            .unwrap_or_default() as f64
+            / 255.0
+    };
+    Ok(ShotTone {
+        shadows: percentile(10),
+        highlights: percentile(90),
+        saturation: saturation / f64::from(count),
+    })
+}
+
+/// Suggest editable brightness, contrast, and saturation for one source frame.
+pub fn suggest_color(
+    asset: &Asset,
+    frame: u32,
+    reference: Option<&Asset>,
+    cancel: &AtomicBool,
+) -> Result<ColorAdjustment> {
+    check_cancel(cancel)?;
+    let source = shot_tone(asset, frame)?;
+    check_cancel(cancel)?;
+    let target = if let Some(reference) = reference {
+        shot_tone(reference, 0)?
+    } else {
+        ShotTone {
+            shadows: 0.12,
+            highlights: 0.88,
+            saturation: source.saturation.max(0.12),
+        }
+    };
+    check_cancel(cancel)?;
+    let source_span = source.highlights - source.shadows;
+    let target_span = target.highlights - target.shadows;
+    let contrast = if source_span < 0.04 {
+        1.0
+    } else {
+        (target_span / source_span).clamp(0.65, 1.35)
+    };
+    let source_midpoint = (source.shadows + source.highlights) * 0.5;
+    let target_midpoint = (target.shadows + target.highlights) * 0.5;
+    let brightness = target_midpoint - (0.5 + (source_midpoint - 0.5) * contrast);
+    let saturation = if source.saturation < 0.025 {
+        0.0
+    } else {
+        (target.saturation / source.saturation - 1.0).clamp(-0.65, 0.4)
+    };
+    Ok(ColorAdjustment {
+        brightness: (brightness * 300.0).round().clamp(-100.0, 100.0) as i8,
+        contrast: ((contrast - 1.0) * 100.0).round() as i8,
+        saturation: (saturation * 100.0).round() as i8,
+    })
 }
 
 pub fn preview_frames(path: &Path, frame: u32) -> Result<Child> {

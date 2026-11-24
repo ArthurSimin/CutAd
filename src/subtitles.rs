@@ -32,42 +32,85 @@ pub fn read(path: &Path) -> Result<Vec<Cue>> {
     parse(&data)
 }
 
-pub fn write(project: &Project, path: &Path) -> Result<usize> {
-    project.validate()?;
-    let path = std::path::absolute(path)?;
-    ensure!(
-        project
-            .assets
-            .iter()
-            .filter_map(|asset| asset.path.as_deref())
-            .all(|source| !same_path(source, &path)),
-        "Choose an SRT file separate from source media."
-    );
+/// Return visible caption clips in timeline order, optionally matching their text.
+pub fn caption_clips<'a>(project: &'a Project, query: &str) -> Vec<(&'a Clip, &'a str)> {
+    caption_clips_in(project, query, None)
+}
+
+fn caption_clips_in<'a>(
+    project: &'a Project,
+    query: &str,
+    row: Option<usize>,
+) -> Vec<(&'a Clip, &'a str)> {
+    let query = query.trim().to_lowercase();
     let captions: HashMap<_, _> = project
         .assets
         .iter()
         .filter_map(|asset| {
             let title = asset.title.as_ref()?;
-            (title.style == TitleStyle::Caption && !title.text.trim().is_empty())
-                .then_some((asset.id.as_str(), title.text.as_str()))
+            (title.style == TitleStyle::Caption
+                && !title.text.trim().is_empty()
+                && (query.is_empty() || title.text.to_lowercase().contains(&query)))
+            .then_some((asset.id.as_str(), title.text.as_str()))
         })
         .collect();
     let mut cues: Vec<_> = project
         .tracks
         .iter()
-        .filter(|track| !track.muted && track.kind == TrackKind::Video)
-        .flat_map(|track| &track.clips)
-        .filter_map(|clip| Some((clip, captions.get(clip.asset_id.as_str())?)))
+        .enumerate()
+        .filter(|(index, track)| {
+            row.is_none_or(|row| row == *index) && !track.muted && track.kind == TrackKind::Video
+        })
+        .flat_map(|(_, track)| &track.clips)
+        .filter_map(|clip| Some((clip, *captions.get(clip.asset_id.as_str())?)))
         .collect();
+    cues.sort_by_key(|(clip, _)| clip.start);
+    cues
+}
+
+pub fn write(project: &Project, path: &Path) -> Result<usize> {
+    write_captions(project, path, true, None)
+}
+
+pub fn write_track(project: &Project, path: &Path, row: usize) -> Result<usize> {
+    write_captions(project, path, true, Some(row))
+}
+
+pub fn write_transcript(project: &Project, path: &Path) -> Result<usize> {
+    write_captions(project, path, false, None)
+}
+
+fn write_captions(
+    project: &Project,
+    path: &Path,
+    timecodes: bool,
+    row: Option<usize>,
+) -> Result<usize> {
+    project.validate()?;
+    let path = std::path::absolute(path)?;
+    ensure!(
+        project
+            .source_paths()
+            .all(|source| !same_path(source, &path)),
+        "Choose a caption file separate from source media."
+    );
+    let cues = caption_clips_in(project, "", row);
     ensure!(
         !cues.is_empty(),
         "Add a caption to an unmuted track before exporting subtitles."
     );
-    cues.sort_by_key(|(clip, _)| clip.start);
 
-    let parent = path.parent().context("Choose an SRT file.")?;
+    let parent = path.parent().context("Choose a caption file.")?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     for (index, (clip, text)) in cues.iter().enumerate() {
+        if !timecodes {
+            writeln!(
+                temp,
+                "{}",
+                text.split_whitespace().collect::<Vec<_>>().join(" ")
+            )?;
+            continue;
+        }
         writeln!(temp, "{}", index + 1)?;
         writeln!(
             temp,
@@ -85,8 +128,7 @@ pub fn write(project: &Project, path: &Path) -> Result<usize> {
         writeln!(temp)?;
     }
     temp.as_file().sync_all()?;
-    temp.persist(path)
-        .context("Could not replace the SRT file.")?;
+    temp.persist(path).context("Could not save the captions.")?;
     Ok(cues.len())
 }
 
@@ -171,6 +213,28 @@ fn milliseconds(timestamp: &str) -> Option<u64> {
 }
 
 pub fn add_tracks(project: &mut Project, cues: Vec<Cue>) -> Result<String> {
+    add_caption_tracks(project, cues, "Captions", 0.0)
+}
+
+pub fn add_english_tracks(
+    project: &mut Project,
+    cues: Vec<Cue>,
+    above_original: bool,
+) -> Result<String> {
+    add_caption_tracks(
+        project,
+        cues,
+        "English captions",
+        if above_original { -0.14 } else { 0.0 },
+    )
+}
+
+fn add_caption_tracks(
+    project: &mut Project,
+    cues: Vec<Cue>,
+    name: &str,
+    offset: f32,
+) -> Result<String> {
     let mut tracks: Vec<Track> = Vec::new();
     let mut assets = Vec::with_capacity(cues.len());
     let mut first = None;
@@ -190,9 +254,9 @@ pub fn add_tracks(project: &mut Project, cues: Vec<Cue>) -> Result<String> {
                 "The SRT has more than eight simultaneous captions."
             );
             let name = if lane == 0 {
-                "Captions".into()
+                name.into()
             } else {
-                format!("Captions {}", lane + 1)
+                format!("{name} {}", lane + 1)
             };
             tracks.push(Track::new(name, TrackKind::Video));
         }
@@ -208,7 +272,7 @@ pub fn add_tracks(project: &mut Project, cues: Vec<Cue>) -> Result<String> {
                 .collect();
         }
         let mut clip = Clip::new(asset.id.clone(), cue.start, 0, cue.end - cue.start);
-        clip.transform.y = -(lane as f32) * 0.10;
+        clip.transform.y = offset - (lane as f32) * 0.10;
         first.get_or_insert_with(|| clip.id.clone());
         assets.push(asset);
         tracks[lane].clips.push(clip);

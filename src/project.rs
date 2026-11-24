@@ -1,4 +1,4 @@
-use crate::effects::{Effect, Transition};
+use crate::effects::{Effect, Transition, TransitionKind};
 use crate::fonts::FontRef;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -9,8 +9,14 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 pub const FPS: u32 = 30;
+pub const NORMAL_SPEED: u16 = 100;
 pub const MAX_FRAMES: u32 = 24 * 60 * 60 * FPS;
-pub const TEMPLATES: [&str; 2] = ["Portrait montage", "Widescreen opener"];
+pub const TEMPLATES: [&str; 4] = [
+    "Portrait montage",
+    "Widescreen opener",
+    "Side-by-side review",
+    "Vertical reveal",
+];
 
 pub fn new_id() -> String {
     Uuid::new_v4().simple().to_string()
@@ -232,10 +238,133 @@ impl Default for Transform {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Framing {
+    pub left: u8,
+    pub right: u8,
+    pub top: u8,
+    pub bottom: u8,
+    pub flip_horizontal: bool,
+    pub flip_vertical: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Darken,
+    Lighten,
+    Difference,
+    Add,
+}
+
+impl BlendMode {
+    pub const ALL: [Self; 7] = [
+        Self::Normal,
+        Self::Multiply,
+        Self::Screen,
+        Self::Darken,
+        Self::Lighten,
+        Self::Difference,
+        Self::Add,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::Difference => "Difference",
+            Self::Add => "Add",
+        }
+    }
+
+    pub(crate) fn filter(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Multiply => Some("multiply"),
+            Self::Screen => Some("screen"),
+            Self::Darken => Some("darken"),
+            Self::Lighten => Some("lighten"),
+            Self::Difference => Some("difference"),
+            Self::Add => Some("addition"),
+        }
+    }
+
+    fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioChannels {
+    #[default]
+    Stereo,
+    Mono,
+    Left,
+    Right,
+}
+
+impl AudioChannels {
+    pub const ALL: [Self; 4] = [Self::Stereo, Self::Mono, Self::Left, Self::Right];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::Mono => "Mix to mono",
+            Self::Left => "Use left channel",
+            Self::Right => "Use right channel",
+        }
+    }
+
+    fn is_stereo(&self) -> bool {
+        *self == Self::Stereo
+    }
+}
+
+impl Framing {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn valid(self) -> bool {
+        u16::from(self.left) + u16::from(self.right) <= 95
+            && u16::from(self.top) + u16::from(self.bottom) <= 95
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ColorAdjustment {
     pub brightness: i8,
     pub contrast: i8,
     pub saturation: i8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HueAdjustment {
+    pub hue: i16,
+    pub saturation: i8,
+    pub intensity: i8,
+}
+
+pub const HUE_RANGES: [(&str, &str); 6] = [
+    ("Red", "r"),
+    ("Yellow", "y"),
+    ("Green", "g"),
+    ("Cyan", "c"),
+    ("Blue", "b"),
+    ("Magenta", "m"),
+];
+
+fn no_hue_adjustments(ranges: &[HueAdjustment; 6]) -> bool {
+    *ranges == [HueAdjustment::default(); 6]
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -317,6 +446,26 @@ fn is_zero(value: &i32) -> bool {
     *value == 0
 }
 
+fn normal_speed() -> u16 {
+    NORMAL_SPEED
+}
+
+fn is_normal_speed(value: &u16) -> bool {
+    *value == NORMAL_SPEED
+}
+
+fn zero_subframe(value: &u8) -> bool {
+    *value == 0
+}
+
+fn zero_duration_remainder(value: &u16) -> bool {
+    *value == 0
+}
+
+fn is_zero_i8(value: &i8) -> bool {
+    *value == 0
+}
+
 pub type AudioFade = ClipFade;
 
 impl ClipFade {
@@ -385,6 +534,7 @@ impl ClipFade {
 }
 
 pub const MAX_POSITION_KEYS: usize = 32;
+pub const MAX_CLIP_SCALE: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PositionKeyframe {
@@ -392,10 +542,53 @@ pub struct PositionKeyframe {
     pub position: [f32; 2],
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Easing {
+    #[default]
+    Linear,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    Hold,
+}
+
+impl Easing {
+    pub const ALL: [Self; 5] = [
+        Self::Linear,
+        Self::EaseIn,
+        Self::EaseOut,
+        Self::EaseInOut,
+        Self::Hold,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::EaseIn => "Ease in",
+            Self::EaseOut => "Ease out",
+            Self::EaseInOut => "Ease in out",
+            Self::Hold => "Hold",
+        }
+    }
+
+    fn apply(self, t: f32) -> f32 {
+        match self {
+            Self::Linear => t,
+            Self::EaseIn => t * t,
+            Self::EaseOut => 1.0 - (1.0 - t).powi(2),
+            Self::EaseInOut => t * t * (3.0 - 2.0 * t),
+            Self::Hold => 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct PositionAnimation {
     pub offset: i32,
     pub keys: Vec<PositionKeyframe>,
+    #[serde(default)]
+    pub easing: Easing,
 }
 
 impl PositionAnimation {
@@ -411,14 +604,116 @@ impl PositionAnimation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ScalarKeyframe {
+    pub frame: i32,
+    #[serde(alias = "opacity")]
+    pub value: f32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ScalarAnimation {
+    pub offset: i32,
+    pub keys: Vec<ScalarKeyframe>,
+    #[serde(default)]
+    pub easing: Easing,
+}
+
+impl ScalarAnimation {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn times(&self, clip_length: u32) -> impl Iterator<Item = u32> + '_ {
+        self.keys.iter().filter_map(move |key| {
+            let relative = key.frame.checked_sub(self.offset)?;
+            let frame = u32::try_from(relative).ok()?;
+            (frame < clip_length).then_some(frame)
+        })
+    }
+
+    fn valid(&self, range: std::ops::RangeInclusive<f32>) -> bool {
+        self.offset.unsigned_abs() <= MAX_FRAMES * 2
+            && self.keys.len() <= MAX_POSITION_KEYS
+            && self
+                .keys
+                .windows(2)
+                .all(|pair| pair[0].frame < pair[1].frame)
+            && self
+                .keys
+                .iter()
+                .all(|key| key.frame.unsigned_abs() <= MAX_FRAMES * 3 && range.contains(&key.value))
+    }
+
+    fn shift(&mut self, frames: i32) {
+        if !self.is_empty() {
+            self.offset = self.offset.saturating_add(frames);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnimatedProperty {
+    Opacity,
+    Rotation,
+    Scale,
+    AudioGain,
+}
+
+impl AnimatedProperty {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Opacity => "Opacity",
+            Self::Rotation => "Rotation",
+            Self::Scale => "Scale",
+            Self::AudioGain => "Gain",
+        }
+    }
+
+    fn range(self) -> std::ops::RangeInclusive<f32> {
+        match self {
+            Self::Opacity => 0.0..=1.0,
+            Self::Rotation => -180.0..=180.0,
+            Self::Scale => 0.1..=MAX_CLIP_SCALE,
+            Self::AudioGain => 0.0..=4.0,
+        }
+    }
+
+    fn parts_mut(self, clip: &mut Clip) -> (&mut ScalarAnimation, &mut f32) {
+        match self {
+            Self::Opacity => (&mut clip.opacity_animation, &mut clip.transform.opacity),
+            Self::Rotation => (&mut clip.rotation_animation, &mut clip.transform.rotation),
+            Self::Scale => (&mut clip.scale_animation, &mut clip.transform.scale),
+            Self::AudioGain => (&mut clip.gain_animation, &mut clip.gain),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Clip {
     pub id: String,
     pub asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub start: u32,
     pub source: u32,
+    #[serde(default, skip_serializing_if = "zero_subframe")]
+    pub source_subframe: u8,
+    #[serde(default = "normal_speed", skip_serializing_if = "is_normal_speed")]
+    pub speed_percent: u16,
+    /// Preserve the fractional source tail when switching between playback speeds.
+    #[serde(default, skip_serializing_if = "zero_duration_remainder")]
+    pub speed_remainder: u16,
+    #[serde(default, skip_serializing_if = "is_zero_i8")]
+    pub pitch_semitones: i8,
+    #[serde(default, skip_serializing_if = "is_zero_i8")]
+    pub audio_balance: i8,
+    #[serde(default, skip_serializing_if = "AudioChannels::is_stereo")]
+    pub audio_channels: AudioChannels,
     pub length: u32,
     pub gain: f32,
+    #[serde(default, skip_serializing_if = "ScalarAnimation::is_empty")]
+    pub gain_animation: ScalarAnimation,
     pub slot: bool,
     #[serde(default)]
     pub effects: Vec<Effect>,
@@ -426,14 +721,28 @@ pub struct Clip {
     pub transition: Option<Transition>,
     #[serde(default)]
     pub transform: Transform,
+    #[serde(default, skip_serializing_if = "Framing::is_default")]
+    pub framing: Framing,
+    #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+    pub blend_mode: BlendMode,
     #[serde(default, skip_serializing_if = "PositionAnimation::is_empty")]
     pub position_animation: PositionAnimation,
+    #[serde(default, skip_serializing_if = "ScalarAnimation::is_empty")]
+    pub opacity_animation: ScalarAnimation,
+    #[serde(default, skip_serializing_if = "ScalarAnimation::is_empty")]
+    pub rotation_animation: ScalarAnimation,
+    #[serde(default, skip_serializing_if = "ScalarAnimation::is_empty")]
+    pub scale_animation: ScalarAnimation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chroma_key: Option<ChromaKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<ClipMask>,
     #[serde(default)]
     pub adjustment: ColorAdjustment,
+    #[serde(default, skip_serializing_if = "no_hue_adjustments")]
+    pub hue_adjustments: [HueAdjustment; 6],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_lut: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "AudioFade::is_empty")]
     pub audio_fade: AudioFade,
     #[serde(default, skip_serializing_if = "ClipFade::is_empty")]
@@ -447,18 +756,33 @@ impl Clip {
         Self {
             id: new_id(),
             asset_id,
+            group_id: None,
             start,
             source,
+            source_subframe: 0,
+            speed_percent: NORMAL_SPEED,
+            speed_remainder: 0,
+            pitch_semitones: 0,
+            audio_balance: 0,
+            audio_channels: AudioChannels::Stereo,
             length,
             gain: 1.0,
+            gain_animation: ScalarAnimation::default(),
             slot: false,
             effects: Vec::new(),
             transition: None,
             transform: Transform::default(),
+            framing: Framing::default(),
+            blend_mode: BlendMode::default(),
             position_animation: PositionAnimation::default(),
+            opacity_animation: ScalarAnimation::default(),
+            rotation_animation: ScalarAnimation::default(),
+            scale_animation: ScalarAnimation::default(),
             chroma_key: None,
             mask: None,
             adjustment: ColorAdjustment::default(),
+            hue_adjustments: [HueAdjustment::default(); 6],
+            color_lut: None,
             audio_fade: AudioFade::default(),
             visual_fade: ClipFade::default(),
             freeze: false,
@@ -473,6 +797,29 @@ impl Clip {
         self.visual_fade.set(in_frames, out_frames, self.length);
     }
 
+    pub fn source_units_at(&self, local: i64) -> i64 {
+        let start = i64::from(self.source) * 100 + i64::from(self.source_subframe);
+        start
+            + if self.freeze {
+                0
+            } else {
+                local * i64::from(self.speed_percent)
+            }
+    }
+
+    pub fn source_frame_at(&self, local: i64) -> u32 {
+        (self.source_units_at(local).max(0) / 100) as u32
+    }
+
+    fn set_source_units(&mut self, units: i64) {
+        self.source = (units / 100) as u32;
+        self.source_subframe = (units % 100) as u8;
+    }
+
+    pub(crate) fn source_duration_units(&self) -> i64 {
+        i64::from(self.length) * i64::from(self.speed_percent) + i64::from(self.speed_remainder)
+    }
+
     pub fn position_at(&self, relative_frame: u32) -> [f32; 2] {
         let animation = &self.position_animation;
         let frame = animation.offset.saturating_add(relative_frame as i32);
@@ -481,7 +828,9 @@ impl Clip {
             .split_at(animation.keys.partition_point(|key| key.frame <= frame));
         match (before.last(), after.first()) {
             (Some(a), Some(b)) => {
-                let t = (frame - a.frame) as f32 / (b.frame - a.frame) as f32;
+                let t = animation
+                    .easing
+                    .apply((frame - a.frame) as f32 / (b.frame - a.frame) as f32);
                 std::array::from_fn(|i| a.position[i] + (b.position[i] - a.position[i]) * t)
             }
             (Some(key), None) | (None, Some(key)) => key.position,
@@ -521,11 +870,149 @@ impl Clip {
         if let Ok(index) = animation.keys.binary_search_by_key(&frame, |key| key.frame) {
             animation.keys.remove(index);
             if animation.keys.is_empty() {
-                animation.offset = 0;
+                *animation = PositionAnimation::default();
                 self.transform.x = x;
                 self.transform.y = y;
             }
         }
+    }
+
+    pub fn opacity_at(&self, relative_frame: u32) -> f32 {
+        self.animated_value(AnimatedProperty::Opacity, relative_frame)
+    }
+
+    pub(crate) fn has_audible_gain(&self) -> bool {
+        if self.gain_animation.is_empty() {
+            self.gain > 0.0
+        } else {
+            self.gain_animation.keys.iter().any(|key| key.value > 0.0)
+        }
+    }
+
+    pub fn animation(&self, property: AnimatedProperty) -> &ScalarAnimation {
+        match property {
+            AnimatedProperty::Opacity => &self.opacity_animation,
+            AnimatedProperty::Rotation => &self.rotation_animation,
+            AnimatedProperty::Scale => &self.scale_animation,
+            AnimatedProperty::AudioGain => &self.gain_animation,
+        }
+    }
+
+    pub fn animated_value(&self, property: AnimatedProperty, relative_frame: u32) -> f32 {
+        let animation = self.animation(property);
+        let frame = animation.offset.saturating_add(relative_frame as i32);
+        let (before, after) = animation
+            .keys
+            .split_at(animation.keys.partition_point(|key| key.frame <= frame));
+        match (before.last(), after.first()) {
+            (Some(a), Some(b)) => {
+                let progress = animation
+                    .easing
+                    .apply((frame - a.frame) as f32 / (b.frame - a.frame) as f32);
+                a.value + (b.value - a.value) * progress
+            }
+            (Some(key), None) | (None, Some(key)) => key.value,
+            (None, None) => match property {
+                AnimatedProperty::Opacity => self.transform.opacity,
+                AnimatedProperty::Rotation => self.transform.rotation,
+                AnimatedProperty::Scale => self.transform.scale,
+                AnimatedProperty::AudioGain => self.gain,
+            },
+        }
+    }
+
+    pub fn set_opacity_keyframe(&mut self, relative_frame: u32, opacity: f32) -> Result<()> {
+        self.set_scalar_keyframe(AnimatedProperty::Opacity, relative_frame, opacity)
+    }
+
+    pub fn set_scalar_keyframe(
+        &mut self,
+        property: AnimatedProperty,
+        relative_frame: u32,
+        value: f32,
+    ) -> Result<()> {
+        ensure!(
+            relative_frame < self.length,
+            "Place the playhead inside this clip."
+        );
+        ensure!(
+            property.range().contains(&value),
+            "{} is out of range.",
+            property.label()
+        );
+        let (animation, _) = property.parts_mut(self);
+        let frame = animation.offset.saturating_add(relative_frame as i32);
+        let key = ScalarKeyframe { frame, value };
+        match animation.keys.binary_search_by_key(&frame, |key| key.frame) {
+            Ok(index) => animation.keys[index] = key,
+            Err(index) => {
+                ensure!(
+                    animation.keys.len() < MAX_POSITION_KEYS,
+                    "This property already has 32 keyframes."
+                );
+                animation.keys.insert(index, key);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_static_value(&mut self, property: AnimatedProperty, value: f32) {
+        *property.parts_mut(self).1 = value;
+    }
+
+    pub fn set_scalar_easing(&mut self, property: AnimatedProperty, easing: Easing) {
+        property.parts_mut(self).0.easing = easing;
+    }
+
+    pub fn remove_scalar_keyframe(&mut self, property: AnimatedProperty, relative_frame: u32) {
+        let value = self.animated_value(property, relative_frame);
+        let (animation, base) = property.parts_mut(self);
+        let frame = animation.offset.saturating_add(relative_frame as i32);
+        if let Ok(index) = animation.keys.binary_search_by_key(&frame, |key| key.frame) {
+            animation.keys.remove(index);
+            if animation.is_empty() {
+                *animation = ScalarAnimation::default();
+                *base = value;
+            }
+        }
+    }
+
+    /// Apply settings for the selected media types without changing the destination edit.
+    pub fn paste_settings(&mut self, source: &Clip, visual: bool, audio: bool) {
+        if visual {
+            self.transform = source.transform;
+            self.framing = source.framing;
+            self.blend_mode = source.blend_mode;
+            self.position_animation
+                .clone_from(&source.position_animation);
+            self.opacity_animation.clone_from(&source.opacity_animation);
+            self.rotation_animation
+                .clone_from(&source.rotation_animation);
+            self.scale_animation.clone_from(&source.scale_animation);
+            self.mask = source.mask;
+            self.chroma_key = source.chroma_key;
+            self.adjustment = source.adjustment;
+            self.hue_adjustments = source.hue_adjustments;
+            self.color_lut.clone_from(&source.color_lut);
+            self.visual_fade = source.visual_fade;
+        }
+        if audio {
+            self.gain = source.gain;
+            self.gain_animation.clone_from(&source.gain_animation);
+            self.pitch_semitones = source.pitch_semitones;
+            self.audio_channels = source.audio_channels;
+            self.audio_balance = source.audio_balance;
+            self.audio_fade = source.audio_fade;
+        }
+        let replaces = |effect: &Effect| if effect.preset.audio() { audio } else { visual };
+        self.effects.retain(|effect| !replaces(effect));
+        self.effects.extend(
+            source
+                .effects
+                .iter()
+                .filter(|effect| replaces(effect))
+                .cloned(),
+        );
     }
 
     pub fn end(&self) -> u32 {
@@ -579,12 +1066,20 @@ impl Track {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Marker {
+    pub frame: u32,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Project {
     pub name: String,
     pub width: u32,
     pub height: u32,
     pub assets: Vec<Asset>,
     pub tracks: Vec<Track>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
 }
 
 impl Default for Project {
@@ -594,6 +1089,7 @@ impl Default for Project {
             width: 1280,
             height: 720,
             assets: Vec::new(),
+            markers: Vec::new(),
             tracks: vec![
                 Track::new("Video 1", TrackKind::Video),
                 Track::new("Audio 1", TrackKind::Audio),
@@ -603,6 +1099,59 @@ impl Default for Project {
 }
 
 impl Project {
+    pub fn set_marker(&mut self, frame: u32, label: &str) -> Result<()> {
+        let label = label.trim();
+        ensure!(
+            frame <= MAX_FRAMES && !label.is_empty() && label.len() <= 256,
+            "Choose a valid timeline position and marker name."
+        );
+        let marker = Marker {
+            frame,
+            label: label.into(),
+        };
+        match self
+            .markers
+            .binary_search_by_key(&frame, |marker| marker.frame)
+        {
+            Ok(index) => self.markers[index] = marker,
+            Err(index) => self.markers.insert(index, marker),
+        }
+        Ok(())
+    }
+
+    pub fn remove_marker(&mut self, frame: u32) {
+        if let Ok(index) = self
+            .markers
+            .binary_search_by_key(&frame, |marker| marker.frame)
+        {
+            self.markers.remove(index);
+        }
+    }
+
+    pub(crate) fn source_paths(&self) -> impl Iterator<Item = &Path> {
+        self.assets
+            .iter()
+            .filter_map(|asset| asset.path.as_deref())
+            .chain(
+                self.tracks
+                    .iter()
+                    .flat_map(|track| &track.clips)
+                    .filter_map(|clip| clip.color_lut.as_deref()),
+            )
+    }
+
+    fn source_paths_mut(&mut self) -> impl Iterator<Item = &mut PathBuf> {
+        self.assets
+            .iter_mut()
+            .filter_map(|asset| asset.path.as_mut())
+            .chain(
+                self.tracks
+                    .iter_mut()
+                    .flat_map(|track| &mut track.clips)
+                    .filter_map(|clip| clip.color_lut.as_mut()),
+            )
+    }
+
     pub fn duration(&self) -> u32 {
         self.tracks
             .iter()
@@ -652,19 +1201,262 @@ impl Project {
         let mut tail = clip.clone();
         tail.id = new_id();
         tail.start = frame;
-        tail.source += if clip.freeze { 0 } else { offset };
+        tail.set_source_units(clip.source_units_at(i64::from(offset)));
         tail.length -= offset;
         if !tail.position_animation.is_empty() {
             tail.position_animation.offset =
                 tail.position_animation.offset.saturating_add(offset as i32);
         }
+        tail.opacity_animation.shift(offset as i32);
+        tail.rotation_animation.shift(offset as i32);
+        tail.scale_animation.shift(offset as i32);
+        tail.gain_animation.shift(offset as i32);
         tail.audio_fade = clip.audio_fade.split(offset, tail.length);
         tail.visual_fade = clip.visual_fade.split(offset, tail.length);
         tail.transition = None;
         clip.length = offset;
+        clip.speed_remainder = 0;
         let id = tail.id.clone();
         self.tracks[row].clips.insert(column + 1, tail);
         Ok(id)
+    }
+
+    /// Insert a silent frame hold and move the remaining clips on the same track forward.
+    pub fn insert_freeze(&mut self, id: &str, frame: u32, length: u32) -> Result<String> {
+        let (row, index) = self.location(id).context("Select a video clip.")?;
+        let clip = &self.tracks[row].clips[index];
+        ensure!(
+            !clip.freeze
+                && !clip.slot
+                && self
+                    .asset(&clip.asset_id)
+                    .is_some_and(|asset| asset.kind == AssetKind::Video),
+            "Choose a regular video clip to freeze."
+        );
+        ensure!(
+            (clip.start..clip.end()).contains(&frame),
+            "Place the playhead inside the clip."
+        );
+        ensure!(
+            length > 0
+                && self.tracks[row]
+                    .clips
+                    .iter()
+                    .filter(|other| other.end() > frame)
+                    .all(|other| other.end().saturating_add(length) <= MAX_FRAMES),
+            "The freeze frame would extend past the timeline limit."
+        );
+
+        let mut hold = clip.clone();
+        let local = frame - clip.start;
+        [hold.transform.x, hold.transform.y] = clip.position_at(local);
+        hold.transform.opacity = clip.opacity_at(local);
+        hold.transform.rotation = clip.animated_value(AnimatedProperty::Rotation, local);
+        hold.transform.scale = clip.animated_value(AnimatedProperty::Scale, local);
+        hold.position_animation = PositionAnimation::default();
+        hold.opacity_animation = ScalarAnimation::default();
+        hold.rotation_animation = ScalarAnimation::default();
+        hold.scale_animation = ScalarAnimation::default();
+        hold.id = new_id();
+        hold.source = clip.source_frame_at(i64::from(local));
+        hold.source_subframe = 0;
+        hold.speed_percent = NORMAL_SPEED;
+        hold.speed_remainder = 0;
+        hold.pitch_semitones = 0;
+        hold.start = frame;
+        hold.length = length;
+        hold.freeze = true;
+        hold.gain = 0.0;
+        hold.gain_animation = ScalarAnimation::default();
+        hold.effects.retain(|effect| !effect.preset.audio());
+        hold.audio_fade = ClipFade::default();
+        hold.visual_fade = ClipFade::default();
+        hold.transition = None;
+
+        if local > 0 {
+            self.split(id, frame)?;
+        } else {
+            self.tracks[row].clips[index].transition = None;
+        }
+        let track = &mut self.tracks[row];
+        for clip in &mut track.clips {
+            if clip.start >= frame {
+                clip.start += length;
+            }
+        }
+        let hold_id = hold.id.clone();
+        track.clips.push(hold);
+        Ok(hold_id)
+    }
+
+    /// Remove an interval from every track and bring the remaining timeline together.
+    pub fn ripple_delete_range(&mut self, start: u32, end: u32) -> Result<()> {
+        ensure!(
+            start < end && end <= self.duration(),
+            "Choose a range within the timeline."
+        );
+        for boundary in [start, end] {
+            let crossing: Vec<_> = self
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .filter(|clip| clip.start < boundary && boundary < clip.end())
+                .map(|clip| clip.id.clone())
+                .collect();
+            for id in crossing {
+                self.split(&id, boundary)?;
+            }
+        }
+        let length = end - start;
+        for track in &mut self.tracks {
+            track
+                .clips
+                .retain(|clip| clip.start < start || clip.start >= end);
+            for clip in &mut track.clips {
+                if clip.start >= end {
+                    clip.start -= length;
+                }
+            }
+        }
+        self.markers
+            .retain(|marker| marker.frame < start || marker.frame >= end);
+        for marker in &mut self.markers {
+            if marker.frame >= end {
+                marker.frame -= length;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ripple_delete(&mut self, id: &str) -> Result<u32> {
+        let (row, index) = self.location(id).context("Select a clip to remove.")?;
+        let track = &mut self.tracks[row];
+        let removed = track.clips.remove(index);
+        for clip in &mut track.clips {
+            if clip.start >= removed.end() {
+                clip.start -= removed.length;
+            }
+        }
+        Ok(removed.start)
+    }
+
+    pub fn close_track_gaps(&mut self, row: usize) -> Result<u32> {
+        let track = self.tracks.get_mut(row).context("Choose a track.")?;
+        let mut ordered: Vec<_> = track.clips.iter().collect();
+        ordered.sort_by_key(|clip| clip.start);
+        ensure!(
+            ordered
+                .windows(2)
+                .all(|pair| pair[0].end() <= pair[1].start),
+            "Resolve overlapping clips first."
+        );
+        let mut packed_start = 0;
+        for clip in ordered {
+            ensure!(
+                clip.group_id.is_none() || clip.start == packed_start,
+                "Ungroup clips that would shift when closing gaps on this track."
+            );
+            packed_start += clip.length;
+        }
+        track.clips.sort_by_key(|clip| clip.start);
+        let mut end = 0;
+        let mut removed = 0;
+        let mut original_end = 0;
+        for clip in &mut track.clips {
+            removed += clip.start - original_end;
+            original_end = clip.end();
+            clip.start = end;
+            end = clip.end();
+        }
+        Ok(removed)
+    }
+
+    pub fn group_clips(&mut self, ids: &HashSet<String>) -> Result<()> {
+        ensure!(ids.len() >= 2, "Select at least two clips to group.");
+        let mut groups = HashSet::new();
+        for id in ids {
+            let (row, index) = self
+                .location(id)
+                .context("A selected clip is no longer present.")?;
+            if let Some(group) = &self.tracks[row].clips[index].group_id {
+                groups.insert(group.clone());
+            }
+        }
+        let group = new_id();
+        for clip in self.tracks.iter_mut().flat_map(|track| &mut track.clips) {
+            if ids.contains(&clip.id)
+                || clip.group_id.as_ref().is_some_and(|id| groups.contains(id))
+            {
+                clip.group_id = Some(group.clone());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ungroup_clip(&mut self, id: &str) -> Result<()> {
+        let (row, index) = self.location(id).context("Choose a clip in a group.")?;
+        let group = self.tracks[row].clips[index]
+            .group_id
+            .clone()
+            .context("This clip is ungrouped.")?;
+        for clip in self.tracks.iter_mut().flat_map(|track| &mut track.clips) {
+            if clip.group_id.as_deref() == Some(group.as_str()) {
+                clip.group_id = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn move_clip_group(&mut self, id: &str, destination_row: usize, start: u32) -> Result<()> {
+        let (row, index) = self.location(id).context("Choose a clip in a group.")?;
+        ensure!(
+            destination_row < self.tracks.len(),
+            "Choose a destination track."
+        );
+        let anchor = &self.tracks[row].clips[index];
+        let group = anchor.group_id.clone().context("This clip is ungrouped.")?;
+        let shift_row = destination_row as i64 - row as i64;
+        let shift_time = i64::from(start) - i64::from(anchor.start);
+        let in_group = |clip: &Clip| clip.group_id.as_deref() == Some(group.as_str());
+        let mut placements = Vec::new();
+        for (row, track) in self.tracks.iter().enumerate() {
+            for clip in track.clips.iter().filter(|clip| in_group(clip)) {
+                let target_row = usize::try_from(row as i64 + shift_row)
+                    .ok()
+                    .filter(|row| *row < self.tracks.len())
+                    .context("The group would extend past the tracks.")?;
+                let target = &self.tracks[target_row];
+                ensure!(
+                    target.kind == track.kind,
+                    "The group needs compatible tracks."
+                );
+                let start = u32::try_from(i64::from(clip.start) + shift_time)
+                    .context("The group would start before the timeline.")?;
+                let end = start.saturating_add(clip.length);
+                ensure!(
+                    end <= MAX_FRAMES,
+                    "The group would extend past the timeline."
+                );
+                ensure!(
+                    target
+                        .clips
+                        .iter()
+                        .filter(|other| !in_group(other))
+                        .all(|other| start >= other.end() || end <= other.start),
+                    "The group would overlap another clip."
+                );
+                let mut moved = clip.clone();
+                moved.start = start;
+                placements.push((target_row, moved));
+            }
+        }
+        for track in &mut self.tracks {
+            track.clips.retain(|clip| !in_group(clip));
+        }
+        for (row, clip) in placements {
+            self.tracks[row].clips.push(clip);
+        }
+        Ok(())
     }
 
     pub fn replace_media(&mut self, id: &str, asset: Asset) -> Result<()> {
@@ -680,13 +1472,18 @@ impl Project {
         ensure!(
             matches!(asset.kind, AssetKind::Image | AssetKind::Text)
                 || clip.freeze && asset.kind == AssetKind::Video
-                || asset.frames >= clip.length,
+                || i64::from(asset.frames) * 100 >= clip.source_duration_units(),
             "The replacement is shorter than the selected clip."
         );
         clip.asset_id.clone_from(&asset.id);
         clip.source = 0;
+        clip.source_subframe = 0;
         clip.slot = false;
         clip.freeze &= asset.kind == AssetKind::Video;
+        if matches!(asset.kind, AssetKind::Image | AssetKind::Text) {
+            clip.speed_percent = NORMAL_SPEED;
+            clip.speed_remainder = 0;
+        }
         if self.asset(&asset.id).is_none() {
             self.assets.push(asset);
         }
@@ -799,11 +1596,18 @@ impl Project {
     }
 
     pub fn add_sticker(&mut self, asset: Asset, position: u32) -> Result<String> {
+        let gif = asset.kind == AssetKind::Video
+            && !asset.audio
+            && asset
+                .path
+                .as_ref()
+                .and_then(|path| path.extension())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
         ensure!(
-            asset.kind == AssetKind::Image && asset.path.is_some(),
-            "Choose a local still image."
+            (asset.kind == AssetKind::Image || gif) && asset.path.is_some(),
+            "Choose a local still image or animated GIF."
         );
-        let length = 2 * FPS;
+        let length = if gif { asset.frames } else { 2 * FPS };
         ensure!(
             position.saturating_add(length) <= MAX_FRAMES,
             "The sticker exceeds the timeline limit."
@@ -833,6 +1637,52 @@ impl Project {
         Ok(id)
     }
 
+    pub fn set_clip_speed(&mut self, id: &str, speed: u16) -> Result<()> {
+        ensure!(
+            (25..=400).contains(&speed),
+            "Choose a speed between 0.25× and 4×."
+        );
+        let (row, index) = self.location(id).context("Select a clip to retime.")?;
+        let track = &self.tracks[row];
+        let clip = &track.clips[index];
+        ensure!(
+            !clip.freeze
+                && !clip.slot
+                && self
+                    .asset(&clip.asset_id)
+                    .is_some_and(|asset| matches!(asset.kind, AssetKind::Video | AssetKind::Audio)),
+            "Choose a video or audio clip to retime."
+        );
+        if clip.speed_percent == speed {
+            return Ok(());
+        }
+        let source_duration = clip.source_duration_units();
+        let length = u32::try_from(source_duration / i64::from(speed))?;
+        ensure!(length > 0, "The clip is too short for that speed.");
+        let delta = i64::from(length) - i64::from(clip.length);
+        let end = clip.end();
+        ensure!(
+            clip.start.saturating_add(length) <= MAX_FRAMES
+                && track
+                    .clips
+                    .iter()
+                    .filter(|other| other.start >= end)
+                    .all(|other| i64::from(other.end()) + delta <= i64::from(MAX_FRAMES)),
+            "The retimed clip would extend past the timeline limit."
+        );
+        let track = &mut self.tracks[row];
+        for other in &mut track.clips {
+            if other.start >= end {
+                other.start = (i64::from(other.start) + delta) as u32;
+            }
+        }
+        let clip = &mut track.clips[index];
+        clip.length = length;
+        clip.speed_percent = speed;
+        clip.speed_remainder = (source_duration % i64::from(speed)) as u16;
+        Ok(())
+    }
+
     pub fn update_clip(
         &mut self,
         id: &str,
@@ -852,6 +1702,10 @@ impl Project {
                 clip.position_animation.offset =
                     clip.position_animation.offset.saturating_add(delta);
             }
+            clip.opacity_animation.shift(delta);
+            clip.rotation_animation.shift(delta);
+            clip.scale_animation.shift(delta);
+            clip.gain_animation.shift(delta);
             (delta, 0)
         } else if clip.start == start {
             (0, clip.end() as i32 - end.min(MAX_FRAMES) as i32)
@@ -860,8 +1714,17 @@ impl Project {
         };
         clip.audio_fade.trim(leading_trim, trailing_trim);
         clip.visual_fade.trim(leading_trim, trailing_trim);
+        let shifted_source = clip.source_units_at(i64::from(leading_trim));
+        if leading_trim != 0 && shifted_source >= 0 && shifted_source / 100 == i64::from(source) {
+            clip.set_source_units(shifted_source);
+        } else if source != clip.source {
+            clip.set_source_units(i64::from(source) * 100);
+            clip.speed_remainder = 0;
+        }
+        if trailing_trim != 0 || leading_trim == 0 && length != clip.length {
+            clip.speed_remainder = 0;
+        }
         clip.start = start;
-        clip.source = source;
         clip.length = length;
         clip.gain = gain;
         self.tracks[row].clips.push(clip);
@@ -869,6 +1732,15 @@ impl Project {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.markers
+                .windows(2)
+                .all(|pair| pair[0].frame < pair[1].frame)
+                && self.markers.iter().all(|marker| marker.frame <= MAX_FRAMES
+                    && !marker.label.trim().is_empty()
+                    && marker.label.len() <= 256),
+            "Invalid timeline markers."
+        );
         ensure!(
             valid_canvas(self.width, self.height),
             "Use even canvas dimensions between 16 and 4096."
@@ -927,19 +1799,46 @@ impl Project {
                         && clip.length > 0
                         && clip.end() <= MAX_FRAMES
                         && clip.source <= MAX_FRAMES
+                        && clip.source_subframe < 100
+                        && clip
+                            .group_id
+                            .as_ref()
+                            .is_none_or(|id| !id.is_empty() && id.len() <= 64)
+                        && (25..=400).contains(&clip.speed_percent)
+                        && clip.speed_remainder < clip.speed_percent
+                        && (-12..=12).contains(&clip.pitch_semitones)
+                        && (-100..=100).contains(&clip.audio_balance)
                         && (0.0..=4.0).contains(&clip.gain),
                     "Invalid clip settings."
                 );
                 let transform = clip.transform;
                 ensure!(
-                    (0.1..=3.0).contains(&transform.scale)
+                    AnimatedProperty::Scale.range().contains(&transform.scale)
                         && (-1.5..=1.5).contains(&transform.x)
                         && (-1.5..=1.5).contains(&transform.y)
                         && (-180.0..=180.0).contains(&transform.rotation)
                         && (0.0..=1.0).contains(&transform.opacity),
                     "Invalid clip transform."
                 );
+                ensure!(clip.framing.valid(), "Invalid crop percentages.");
                 let animation = &clip.position_animation;
+                ensure!(
+                    clip.opacity_animation
+                        .valid(AnimatedProperty::Opacity.range())
+                        && clip
+                            .rotation_animation
+                            .valid(AnimatedProperty::Rotation.range()),
+                    "Invalid opacity or rotation keyframes."
+                );
+                ensure!(
+                    clip.scale_animation.valid(AnimatedProperty::Scale.range()),
+                    "Invalid scale keyframes."
+                );
+                ensure!(
+                    clip.gain_animation
+                        .valid(AnimatedProperty::AudioGain.range()),
+                    "Invalid gain keyframes."
+                );
                 ensure!(
                     animation.offset.unsigned_abs() <= MAX_FRAMES * 2
                         && animation.keys.len() <= MAX_POSITION_KEYS
@@ -955,6 +1854,20 @@ impl Project {
                     "Invalid position keyframes."
                 );
                 let correction = clip.adjustment;
+                ensure!(
+                    clip.hue_adjustments.into_iter().all(|range| {
+                        (-180..=180).contains(&range.hue)
+                            && (-100..=100).contains(&range.saturation)
+                            && (-100..=100).contains(&range.intensity)
+                    }),
+                    "Invalid hue-range adjustments."
+                );
+                ensure!(
+                    clip.color_lut.as_ref().is_none_or(|path| path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("cube"))),
+                    "Select a .cube color LUT."
+                );
                 ensure!(
                     [
                         correction.brightness,
@@ -1000,7 +1913,8 @@ impl Project {
                         clip.source < asset.frames && track.kind == TrackKind::Video
                     } else {
                         matches!(asset.kind, AssetKind::Image | AssetKind::Text)
-                            || clip.source + clip.length <= asset.frames
+                            || clip.source_units_at(0) + clip.source_duration_units()
+                                <= i64::from(asset.frames) * 100
                     },
                     "A clip extends past its source media."
                 );
@@ -1057,26 +1971,24 @@ pub fn save(project: &Project, path: &Path) -> Result<()> {
     let path = std::path::absolute(path)?;
     let parent = path.parent().context("Choose a project file.")?;
     let mut copy = project.clone();
-    for asset in &mut copy.assets {
-        if let Some(media) = &mut asset.path {
-            let absolute = std::path::absolute(&*media)?;
-            ensure!(
-                !same_path(&absolute, &path),
-                "Choose a project file separate from source media."
+    for media in copy.source_paths_mut() {
+        let absolute = std::path::absolute(&*media)?;
+        ensure!(
+            !same_path(&absolute, &path),
+            "Choose a project file separate from source media."
+        );
+        *media = absolute
+            .strip_prefix(parent)
+            .unwrap_or(&absolute)
+            .to_owned();
+        #[cfg(windows)]
+        {
+            *media = PathBuf::from(
+                media
+                    .to_str()
+                    .context("Invalid media path.")?
+                    .replace('\\', "/"),
             );
-            *media = absolute
-                .strip_prefix(parent)
-                .unwrap_or(&absolute)
-                .to_owned();
-            #[cfg(windows)]
-            {
-                *media = PathBuf::from(
-                    media
-                        .to_str()
-                        .context("Invalid media path.")?
-                        .replace('\\', "/"),
-                );
-            }
         }
     }
     let mut temp = NamedTempFile::new_in(parent)?;
@@ -1106,10 +2018,8 @@ pub fn load(path: &Path) -> Result<Project> {
         data.format == "cutad" && data.version == 1 && data.fps == FPS,
         "Unsupported CutAd project format or version."
     );
-    for asset in &mut data.project.assets {
-        if let Some(path) = &mut asset.path {
-            *path = parent.join(&*path);
-        }
+    for path in data.project.source_paths_mut() {
+        *path = parent.join(&*path);
     }
     let empty: HashSet<_> = data
         .project
@@ -1133,6 +2043,56 @@ pub fn load(path: &Path) -> Result<Project> {
 }
 
 pub fn template(name: &str) -> Result<Project> {
+    fn slot<'a>(
+        project: &'a mut Project,
+        row: usize,
+        label: &str,
+        start: u32,
+        length: u32,
+    ) -> &'a mut Clip {
+        let asset = Asset::placeholder(label, AssetKind::Image, length);
+        let mut clip = Clip::new(asset.id.clone(), start, 0, length);
+        clip.slot = true;
+        project.assets.push(asset);
+        project.tracks[row].clips.push(clip);
+        project.tracks[row].clips.last_mut().unwrap()
+    }
+
+    let mut project = Project {
+        name: name.into(),
+        ..Project::default()
+    };
+    match name {
+        "Side-by-side review" => {
+            project.tracks[0].name = "Left panel".into();
+            project
+                .tracks
+                .push(Track::new("Right panel", TrackKind::Video));
+            for (row, label, x) in [(0, "Left shot", -0.25), (2, "Right shot", 0.25)] {
+                slot(&mut project, row, label, 0, 120).transform = Transform {
+                    scale: 0.48,
+                    x,
+                    ..Transform::default()
+                };
+            }
+            project.add_title(TitleStyle::LowerThird, "Side-by-side review", 30)?;
+            return Ok(project);
+        }
+        "Vertical reveal" => {
+            (project.width, project.height) = (720, 1280);
+            slot(&mut project, 0, "Setup", 0, 60).set_visual_fade(9, 0);
+            let reveal = slot(&mut project, 0, "Reveal", 60, 90);
+            reveal.transition = Some(Transition {
+                kind: TransitionKind::CircleOpen,
+                frames: 12,
+            });
+            reveal.set_visual_fade(0, 12);
+            project.add_title(TitleStyle::LowerThird, "The reveal", 60)?;
+            return Ok(project);
+        }
+        _ => {}
+    }
+
     let (width, height, slots) = match name {
         "Portrait montage" => (
             720,
@@ -1146,18 +2106,10 @@ pub fn template(name: &str) -> Result<Project> {
         ),
         _ => bail!("Unknown CutAd template."),
     };
-    let mut project = Project {
-        name: name.into(),
-        width,
-        height,
-        ..Project::default()
-    };
-    for (name, length) in slots {
-        let asset = Asset::placeholder(name, AssetKind::Image, length);
-        let mut clip = Clip::new(asset.id.clone(), project.duration(), 0, length);
-        clip.slot = true;
-        project.assets.push(asset);
-        project.tracks[0].clips.push(clip);
+    (project.width, project.height) = (width, height);
+    for (label, length) in slots {
+        let start = project.duration();
+        slot(&mut project, 0, label, start, length);
     }
     Ok(project)
 }
@@ -1188,6 +2140,9 @@ pub fn as_template(project: &Project) -> Project {
             clip.asset_id.clone_from(&asset.id);
             clip.slot = true;
             clip.source = 0;
+            clip.source_subframe = 0;
+            clip.speed_percent = NORMAL_SPEED;
+            clip.speed_remainder = 0;
             template.assets.push(asset);
         }
     }

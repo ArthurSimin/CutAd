@@ -6,10 +6,12 @@ mod font_browser;
 mod gallery;
 mod playback;
 mod preview;
+mod recovery;
 mod theme;
 mod thumbnails;
 mod timeline;
 mod typography;
+mod voiceover;
 mod waveforms;
 
 use anyhow::{Context, Result, bail};
@@ -86,9 +88,22 @@ fn run() -> Result<()> {
             let project = project::load(source)?;
             let cancel = AtomicBool::new(false);
             match option {
-                "--export-audio" => media::render_audio_master(&project, output, &cancel, |_| {})?,
+                "--export-audio" => media::export_audio(
+                    &project,
+                    output,
+                    media::AudioFormat::from_path(output)?,
+                    &cancel,
+                    |_| {},
+                )?,
                 "--export-captions" => {
-                    cutad::subtitles::write(&project, output)?;
+                    if output
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                    {
+                        cutad::subtitles::write_transcript(&project, output)?;
+                    } else {
+                        cutad::subtitles::write(&project, output)?;
+                    }
                 }
                 "--export-frame" => {
                     let frame = args
@@ -122,7 +137,8 @@ fn run() -> Result<()> {
                 Some("mp4") => media::Format::Mp4,
                 Some("webm") => media::Format::Webm,
                 Some("mkv") => media::Format::Mkv,
-                _ => bail!("Export must end in .mp4, .webm, or .mkv."),
+                Some("gif") => media::Format::Gif,
+                _ => bail!("Export must end in .mp4, .webm, .mkv, or .gif."),
             };
             let project = project::load(source)?;
             return media::render_with(

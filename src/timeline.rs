@@ -5,6 +5,7 @@ use cutad::project::{Asset, AssetKind, Clip, FPS, Project, TrackKind, timestamp}
 use eframe::egui::{
     self, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
 };
+use std::collections::HashSet;
 
 const HEADER: f32 = 126.0;
 const RULER: f32 = 32.0;
@@ -50,18 +51,29 @@ pub struct Timeline {
 pub enum ClipAction {
     Split,
     Duplicate,
+    Ungroup,
     TrimLeft,
     TrimRight,
+    Freeze,
+    Reverse,
+    InterpolateMotion,
+    Stabilize,
+    RemoveBackground,
+    SplitScenes,
     DetachAudio,
     Replace,
     Effects,
     Remove,
+    RippleDelete,
+    CopySettings,
+    PasteSettings,
 }
 
 pub struct MediaDrag(pub String);
 
 pub struct Interaction {
     pub select: Option<Selection>,
+    pub toggle_selection: Option<Selection>,
     pub seek: Option<u32>,
     pub edit: Option<Placement>,
     pub action: Option<(String, ClipAction)>,
@@ -71,9 +83,11 @@ pub struct Interaction {
 pub struct View<'a> {
     pub project: &'a Project,
     pub selection: &'a Selection,
+    pub multi_selection: &'a HashSet<String>,
     pub frame: u32,
     pub zoom: f32,
     pub snap: bool,
+    pub can_paste_settings: bool,
 }
 
 impl Timeline {
@@ -85,6 +99,7 @@ impl Timeline {
     ) -> Interaction {
         let mut events = Interaction {
             select: None,
+            toggle_selection: None,
             seek: None,
             edit: None,
             action: None,
@@ -171,10 +186,15 @@ impl Timeline {
                     && let Some(cursor) = cursor
                 {
                     if let Some((row, clip, _)) = hit(view.project, rect, scale, cursor) {
-                        events.select = Some(Selection {
+                        let selection = Selection {
                             row,
                             clip: Some(clip.id.clone()),
-                        });
+                        };
+                        if ui.input(|input| input.modifiers.command) {
+                            events.toggle_selection = Some(selection);
+                        } else {
+                            events.select = Some(selection);
+                        }
                     } else {
                         if cursor.y >= rect.top() + RULER {
                             events.select = Some(Selection {
@@ -208,17 +228,86 @@ impl Timeline {
                         && !clip.freeze
                         && asset.is_some_and(|asset| asset.audio);
                     let inside = clip.start < view.frame && view.frame < clip.end();
+                    let can_freeze = !clip.freeze
+                        && !clip.slot
+                        && asset.is_some_and(|asset| asset.kind == AssetKind::Video)
+                        && (clip.start..clip.end()).contains(&view.frame);
                     response.context_menu(|ui| {
                         ui.set_min_width(174.0);
                         for (label, action, enabled) in [
                             ("Split at playhead", ClipAction::Split, inside),
                             ("Trim start to playhead", ClipAction::TrimLeft, inside),
                             ("Trim end to playhead", ClipAction::TrimRight, inside),
+                            ("Insert freeze frame", ClipAction::Freeze, can_freeze),
+                            (
+                                "Reverse clip…",
+                                ClipAction::Reverse,
+                                !clip.freeze
+                                    && !clip.slot
+                                    && asset.is_some_and(|asset| {
+                                        matches!(asset.kind, AssetKind::Video | AssetKind::Audio)
+                                    }),
+                            ),
+                            (
+                                "Split at scene changes",
+                                ClipAction::SplitScenes,
+                                !clip.freeze
+                                    && !clip.slot
+                                    && clip.length > 1
+                                    && clip.speed_percent == cutad::project::NORMAL_SPEED
+                                    && clip.source_subframe == 0
+                                    && asset.is_some_and(|asset| asset.kind == AssetKind::Video),
+                            ),
+                            (
+                                "Generate optical flow…",
+                                ClipAction::InterpolateMotion,
+                                !clip.freeze
+                                    && !clip.slot
+                                    && track.kind == TrackKind::Video
+                                    && asset.is_some_and(|asset| {
+                                        asset.kind == AssetKind::Video
+                                            && asset
+                                                .geometry
+                                                .is_none_or(|geometry| geometry.fps < 120)
+                                    }),
+                            ),
                             ("Duplicate clip", ClipAction::Duplicate, true),
+                            ("Ungroup", ClipAction::Ungroup, clip.group_id.is_some()),
+                            (
+                                "Stabilize clip…",
+                                ClipAction::Stabilize,
+                                !clip.freeze
+                                    && !clip.slot
+                                    && track.kind == TrackKind::Video
+                                    && asset.is_some_and(|asset| asset.kind == AssetKind::Video),
+                            ),
+                            (
+                                "Remove background…",
+                                ClipAction::RemoveBackground,
+                                !clip.freeze
+                                    && !clip.slot
+                                    && track.kind == TrackKind::Video
+                                    && asset.is_some_and(|asset| {
+                                        matches!(asset.kind, AssetKind::Video | AssetKind::Image)
+                                    }),
+                            ),
                             ("Detach audio", ClipAction::DetachAudio, has_audio),
                             ("Replace media…", ClipAction::Replace, true),
                             ("Clip effects", ClipAction::Effects, true),
+                            (
+                                "Copy clip settings",
+                                ClipAction::CopySettings,
+                                track.kind == TrackKind::Video
+                                    || has_audio
+                                    || asset.is_some_and(|asset| asset.audio),
+                            ),
+                            (
+                                "Paste clip settings",
+                                ClipAction::PasteSettings,
+                                view.can_paste_settings,
+                            ),
                             ("Remove clip", ClipAction::Remove, true),
+                            ("Ripple delete", ClipAction::RippleDelete, true),
                         ] {
                             if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                                 events.action = Some((id.clone(), action));
@@ -257,6 +346,18 @@ impl Timeline {
             FontId::proportional(13.0),
             TEXT,
         );
+        let primary_group = view
+            .selection
+            .clip
+            .as_deref()
+            .and_then(|id| selected_group(project, id));
+        let moving_group = self.drag.as_ref().and_then(|drag| {
+            if matches!(drag.mode, Move::Slide) {
+                selected_group(project, &drag.original.id).map(|group| (group, drag))
+            } else {
+                None
+            }
+        });
         for (row, track) in project.tracks.iter().enumerate() {
             let y = rect.top() + RULER + row as f32 * ROW;
             if y > visible.bottom() || y + ROW < visible.top() {
@@ -326,7 +427,22 @@ impl Timeline {
                 {
                     continue;
                 }
-                let bounds = clip_rect(rect, scale, row, clip.start, clip.length);
+                let (paint_row, paint_start) = moving_group
+                    .filter(|(group, _)| clip.group_id.as_deref() == Some(group))
+                    .and_then(|(_, drag)| {
+                        let row = usize::try_from(
+                            row as i64 + drag.proposed.row as i64 - drag.original.row as i64,
+                        )
+                        .ok()?;
+                        let start = u32::try_from(
+                            i64::from(clip.start) + i64::from(drag.proposed.start)
+                                - i64::from(drag.original.start),
+                        )
+                        .ok()?;
+                        (row < project.tracks.len()).then_some((row, start))
+                    })
+                    .unwrap_or((row, clip.start));
+                let bounds = clip_rect(rect, scale, paint_row, paint_start, clip.length);
                 paint_clip(
                     painter,
                     bounds,
@@ -334,7 +450,10 @@ impl Timeline {
                     project,
                     clip,
                     track.kind,
-                    view.selection.clip.as_deref() == Some(&clip.id),
+                    view.selection.clip.as_deref() == Some(&clip.id)
+                        || view.multi_selection.contains(&clip.id)
+                        || primary_group
+                            .is_some_and(|group| clip.group_id.as_deref() == Some(group)),
                     thumbnails,
                 );
             }
@@ -356,6 +475,18 @@ impl Timeline {
             );
         }
         let x = header + view.frame as f32 * scale;
+        let marker_color = Color32::from_rgb(244, 180, 71);
+        for marker in &project.markers {
+            let x = header + marker.frame as f32 * scale;
+            if x >= (visible.left() - 8.0).max(header) && x <= visible.right() + 8.0 {
+                let y = rect.top() + RULER - 4.0;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![pos2(x - 4.0, y - 7.0), pos2(x + 4.0, y - 7.0), pos2(x, y)],
+                    marker_color,
+                    Stroke::NONE,
+                ));
+            }
+        }
         painter.line_segment(
             [pos2(x, rect.top() + RULER - 4.0), pos2(x, visible.bottom())],
             Stroke::new(1.3, ACCENT),
@@ -395,7 +526,12 @@ fn hit(project: &Project, rect: Rect, scale: f32, pos: Pos2) -> Option<(usize, &
     })
 }
 
-fn snapped(view: &View<'_>, scale: f32, current: &str, position: i64) -> u32 {
+fn selected_group<'a>(project: &'a Project, id: &str) -> Option<&'a str> {
+    let (row, index) = project.location(id)?;
+    project.tracks[row].clips[index].group_id.as_deref()
+}
+
+fn snapped(view: &View<'_>, scale: f32, current: &str, group: Option<&str>, position: i64) -> u32 {
     let pos = position.max(0) as u32;
     if !view.snap {
         return pos;
@@ -405,10 +541,13 @@ fn snapped(view: &View<'_>, scale: f32, current: &str, position: i64) -> u32 {
         .tracks
         .iter()
         .flat_map(|track| &track.clips)
-        .filter(|clip| clip.id != current)
+        .filter(|clip| {
+            clip.id != current && group.is_none_or(|group| clip.group_id.as_deref() != Some(group))
+        })
         .flat_map(|clip| [clip.start, clip.end()]);
     anchors
         .chain([0, view.frame])
+        .chain(view.project.markers.iter().map(|marker| marker.frame))
         .min_by_key(|frame| frame.abs_diff(pos))
         .filter(|frame| frame.abs_diff(pos) as f32 * scale <= 8.0)
         .unwrap_or(pos)
@@ -417,41 +556,54 @@ fn snapped(view: &View<'_>, scale: f32, current: &str, position: i64) -> u32 {
 fn update_drag(drag: &mut Drag, view: &View<'_>, rect: Rect, scale: f32, cursor: Pos2, frame: u32) {
     let original = &drag.original;
     let delta = i64::from(frame) - i64::from(drag.anchor);
-    let position = |value| snapped(view, scale, &original.id, i64::from(value) + delta);
     let proposed = &mut drag.proposed;
     let end = original.start + original.length;
-    let frozen = view
-        .project
-        .location(&original.id)
-        .is_some_and(|(row, col)| view.project.tracks[row].clips[col].freeze);
+    let Some((row, col)) = view.project.location(&original.id) else {
+        return;
+    };
+    let clip = &view.project.tracks[row].clips[col];
+    let group = matches!(drag.mode, Move::Slide)
+        .then_some(clip.group_id.as_deref())
+        .flatten();
+    let position = |value| snapped(view, scale, &original.id, group, i64::from(value) + delta);
     match drag.mode {
         Move::Slide => {
-            proposed.start = position(original.start);
+            let minimum = group.map_or(0, |group| {
+                let first = view
+                    .project
+                    .tracks
+                    .iter()
+                    .flat_map(|track| &track.clips)
+                    .filter(|member| member.group_id.as_deref() == Some(group))
+                    .map(|member| member.start)
+                    .min()
+                    .unwrap_or(original.start);
+                original.start - first
+            });
+            proposed.start = position(original.start).max(minimum);
             proposed.row = row_at(view.project, rect, cursor);
         }
         Move::TrimStart => {
-            let min = if frozen {
+            let min = if clip.freeze {
                 0
             } else {
-                original.start.saturating_sub(original.source)
+                original.start.saturating_sub(
+                    (clip.source_units_at(0) / i64::from(clip.speed_percent)) as u32,
+                )
             };
             let start = position(original.start).clamp(min, end - 1);
             proposed.start = start;
-            if !frozen {
-                proposed.source = original.source + start - original.start;
-            }
+            proposed.source = clip.source_frame_at(i64::from(start) - i64::from(original.start));
             proposed.length = end - start;
         }
         Move::TrimEnd => {
             let mut end = position(end);
-            if !frozen
-                && let Some((row, column)) = view.project.location(&original.id)
-                && let Some(asset) = view
-                    .project
-                    .asset(&view.project.tracks[row].clips[column].asset_id)
+            if !clip.freeze
+                && let Some(asset) = view.project.asset(&clip.asset_id)
                 && !matches!(asset.kind, AssetKind::Image | AssetKind::Text)
             {
-                end = end.min(original.start + asset.frames - original.source);
+                let available = i64::from(asset.frames) * 100 - clip.source_units_at(0);
+                end = end.min(original.start + (available / i64::from(clip.speed_percent)) as u32);
             }
             proposed.length = end.saturating_sub(original.start).max(1);
         }
@@ -507,6 +659,12 @@ fn paint_clip(
         if clip.freeze {
             label.push_str("  ·  Freeze");
         }
+        if clip.speed_percent != cutad::project::NORMAL_SPEED {
+            label.push_str(&format!(
+                "  ·  {:.2}×",
+                f32::from(clip.speed_percent) / 100.0
+            ));
+        }
         if !clip.effects.is_empty() {
             label.push_str(&format!("  ·  {} FX", clip.effects.len()));
         }
@@ -524,12 +682,8 @@ fn paint_clip(
             let last = (((visible.right() - bounds.left()).max(0.0) / tile_width).ceil() as u32)
                 .min(count);
             for index in first..last {
-                let frame = if clip.freeze {
-                    clip.source
-                } else {
-                    clip.source
-                        + (u64::from(index) * u64::from(clip.length) / u64::from(count)) as u32
-                };
+                let local = i64::from(index) * i64::from(clip.length) / i64::from(count);
+                let frame = clip.source_frame_at(local);
                 if let Some(texture) = thumbnails.image(painter.ctx(), asset, frame) {
                     let tile = Rect::from_min_size(
                         pos2(bounds.left() + index as f32 * tile_width, thumbnails_top),
@@ -558,7 +712,16 @@ fn paint_clip(
                 &mut thumbnails.waveforms,
             );
         }
-        for frame in clip.position_animation.times(clip.length) {
+        let mut keyframes = clip
+            .position_animation
+            .times(clip.length)
+            .chain(clip.opacity_animation.times(clip.length))
+            .chain(clip.rotation_animation.times(clip.length))
+            .chain(clip.scale_animation.times(clip.length))
+            .collect::<Vec<_>>();
+        keyframes.sort_unstable();
+        keyframes.dedup();
+        for frame in keyframes {
             let x = bounds.left() + bounds.width() * frame as f32 / clip.length as f32;
             let center = pos2(
                 x.clamp(bounds.left() + 5.0, bounds.right() - 5.0),
@@ -601,9 +764,13 @@ fn paint_waveform(
     let scale = strip.width() / clip.length as f32;
     let first = ((view.left() - strip.left()) / scale).floor().max(0.0) as u32;
     let end = (((view.right() - strip.left()) / scale).ceil() as u32).min(clip.length);
-    let step = ((view.width() / 520.0).max(1.0) / scale).ceil().max(1.0) as u32;
-    let source_begin = clip.source + first;
-    let source_end = clip.source + end;
+    let source_scale = scale * 100.0 / f32::from(clip.speed_percent);
+    let source_zero = clip.source_units_at(0) as f32 / 100.0;
+    let step = ((view.width() / 520.0).max(1.0) / source_scale)
+        .ceil()
+        .max(1.0) as u32;
+    let source_begin = clip.source_frame_at(i64::from(first));
+    let source_end = ((clip.source_units_at(i64::from(end)) + 99) / 100) as u32;
     let mut shapes = Vec::new();
     let mut start = (source_begin / BLOCK_FRAMES) * BLOCK_FRAMES;
     while start < source_end {
@@ -617,7 +784,8 @@ fn paint_waveform(
                     continue;
                 }
                 let amplitude = (f32::from(peak) / 255.0 * clip.gain).min(1.0);
-                let x = strip.left() + (min - clip.source + i as u32 * step) as f32 * scale;
+                let x =
+                    strip.left() + ((min + i as u32 * step) as f32 - source_zero) * source_scale;
                 let height = (strip.height() * 0.5 * amplitude).max(0.65);
                 let y = strip.center().y;
                 shapes.push(egui::Shape::line_segment(

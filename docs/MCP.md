@@ -24,6 +24,6 @@ Start with “Inspect my CutAd project and list the clips with start and end tim
 
 When you want the client to make changes, regenerate its entry with `--write` at the end. Save and close the desktop project first. Use one write-enabled session per project and reopen the file in the editor to see the changes.
 
-Read-only mode exposes `inspect_project`. Write mode also exposes `add_title`, `split_clip`, `set_clip_gain`, and `export`. Frame numbers use the project timeline’s 30 fps clock. Export accepts a new filename for MP4, WebM, MKV, WAV, or SRT next to the project. FFmpeg must be on PATH or beside CutAd for media export. Existing output files are protected.
+Read-only mode exposes `inspect_project`. Write mode also exposes `add_title`, `split_clip`, `set_clip_gain`, `set_gain_keyframe`, and `export`. Frame numbers use the project timeline’s 30 fps clock. `set_clip_gain` sets a constant gain across the clip. `set_gain_keyframe` sets the gain at a frame inside a clip with audio. Export accepts a new filename for MP4, WebM, MKV, GIF, WAV, FLAC, MP3, or SRT next to the project. FFmpeg must be on PATH or beside CutAd for media export. Existing output files are protected.
 
 CutAd MCP runs locally. Your AI client controls its model requests and access to tool results.

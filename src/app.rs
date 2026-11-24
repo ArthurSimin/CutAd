@@ -3,6 +3,7 @@ use crate::export_dialog::{Decision, ExportDialog};
 use crate::font_browser::{Choice as FontChoice, FontBrowser};
 use crate::gallery::Gallery;
 use crate::preview::Preview;
+use crate::recovery::{self, Autosave, Candidate};
 use crate::theme::{self, ACCENT, ACCENT_DARK, BACK, LIME, LINE, MUTED, TEXT};
 use crate::thumbnails::Thumbnails;
 use crate::timeline::{ClipAction, MediaDrag, Placement, Selection, Timeline, View};
@@ -18,6 +19,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, vec2,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -41,7 +43,27 @@ enum Completed {
     Export(PathBuf),
     MatchCanvas(String, VideoGeometry),
     Subtitles(Vec<cutad::subtitles::Cue>),
+    EnglishSubtitles(
+        Vec<cutad::subtitles::Cue>,
+        Option<Vec<cutad::subtitles::Cue>>,
+    ),
     CaptionExport(PathBuf, usize),
+    Scenes(project::Clip, Vec<u32>),
+    Prepared(MediaPreparation, project::Clip, Asset, u8),
+    Tracked(project::Clip, project::PositionAnimation),
+    Loudness(project::Clip, f32, f64),
+    ColorSuggested(project::Clip, ColorAdjustment, bool),
+    Reframed(project::Clip, [u32; 2], f32, project::PositionAnimation),
+    Voiceover(Asset, u32, usize),
+    Beats(project::Clip, Vec<u32>),
+}
+
+#[derive(Clone, Copy)]
+enum MediaPreparation {
+    Reverse,
+    InterpolateMotion,
+    Stabilize,
+    Cutout,
 }
 
 struct Job {
@@ -51,6 +73,26 @@ struct Job {
     result: Receiver<Result<Completed>>,
     worker: JoinHandle<()>,
     cancellable: bool,
+}
+
+struct VoiceoverSetup {
+    devices: Vec<String>,
+    monitor: bool,
+    device: Option<String>,
+}
+
+struct ActiveVoiceover {
+    take: crate::voiceover::Recording,
+    start: u32,
+    row: usize,
+    monitor: bool,
+    requested_playback: bool,
+}
+
+struct CopiedClipSettings {
+    clip: project::Clip,
+    visual: bool,
+    audio: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,11 +129,19 @@ enum InspectorTab {
 enum LiveControl {
     Text,
     Transform,
+    Framing,
+    Blend,
     Motion,
+    OpacityAnimation,
+    RotationAnimation,
+    ScaleAnimation,
+    AudioGainAnimation,
     VisualFade,
     Color,
     Mask,
     Gain,
+    Pitch,
+    AudioChannels,
 }
 
 pub struct Editor {
@@ -103,8 +153,10 @@ pub struct Editor {
     future: Vec<Project>,
     last_live_edit: Option<(LiveControl, Instant)>,
     selection: Selection,
+    multi_selection: HashSet<String>,
     asset_id: Option<String>,
     edit: Option<(Placement, f32)>,
+    copied_clip_settings: Option<CopiedClipSettings>,
     library: LibraryTab,
     show_library: bool,
     show_inspector: bool,
@@ -116,6 +168,10 @@ pub struct Editor {
     media_query: String,
     media_kind: Option<AssetKind>,
     audio_presets: bool,
+    show_transcript: bool,
+    tracking_seed: cutad::tracking::Seed,
+    show_tracking_patch: bool,
+    transcript_query: String,
     inspector_tab: InspectorTab,
     transform: Transform,
     title: Option<Title>,
@@ -126,9 +182,16 @@ pub struct Editor {
     frame: u32,
     zoom: f32,
     snap: bool,
+    main_track_magnet: bool,
     timeline: Timeline,
     thumbnails: Thumbnails,
     preview: Preview,
+    autosave: Autosave,
+    recovery_candidates: Option<Vec<Candidate>>,
+    recent_projects: Vec<PathBuf>,
+    draft_saved: bool,
+    voiceover_setup: Option<VoiceoverSetup>,
+    voiceover: Option<ActiveVoiceover>,
     texture: Option<egui::TextureHandle>,
     job: Option<Job>,
     status: String,
@@ -147,8 +210,10 @@ impl Editor {
             future: Vec::new(),
             last_live_edit: None,
             selection: Selection { row: 0, clip: None },
+            multi_selection: HashSet::new(),
             asset_id: None,
             edit: None,
+            copied_clip_settings: None,
             library: LibraryTab::Media,
             show_library: true,
             show_inspector: true,
@@ -160,6 +225,10 @@ impl Editor {
             media_query: String::new(),
             media_kind: None,
             audio_presets: false,
+            show_transcript: false,
+            tracking_seed: cutad::tracking::Seed::default(),
+            show_tracking_patch: false,
+            transcript_query: String::new(),
             inspector_tab: InspectorTab::Video,
             transform: Transform::default(),
             title: None,
@@ -170,9 +239,16 @@ impl Editor {
             frame: 0,
             zoom: 96.0,
             snap: true,
+            main_track_magnet: false,
             timeline: Timeline::default(),
             thumbnails: Thumbnails::default(),
             preview: Preview::default(),
+            autosave: Autosave::default(),
+            recovery_candidates: None,
+            recent_projects: recovery::recent_projects(),
+            draft_saved: false,
+            voiceover_setup: None,
+            voiceover: None,
             texture: None,
             job: None,
             status: "Import local files or start from a template.".into(),
@@ -180,6 +256,10 @@ impl Editor {
         };
         if let Some(path) = path {
             editor.open_path(path);
+        } else if let Ok(candidates) = recovery::candidates()
+            && !candidates.is_empty()
+        {
+            editor.recovery_candidates = Some(candidates);
         }
         editor
     }
@@ -202,7 +282,148 @@ impl Editor {
         self.preview.pause();
     }
 
+    fn collect_voiceover(&mut self, ctx: &egui::Context) {
+        let Some(active) = &mut self.voiceover else {
+            return;
+        };
+        if let Some(result) = active.take.result() {
+            let active = self.voiceover.take().expect("active voiceover");
+            self.stop_player();
+            match result {
+                Ok(Some(path)) => {
+                    let (start, row) = (active.start, active.row);
+                    self.start_job(ctx, "Adding voiceover", JobStyle::Read, move |_, _| {
+                        Ok(Completed::Voiceover(media::probe(&path)?, start, row))
+                    });
+                }
+                Ok(None) => self.status = "Voiceover discarded.".into(),
+                Err(error) => self.error("Record voiceover", error),
+            }
+            return;
+        }
+        if active.take.ready() && !active.take.capturing() && !active.take.finishing() {
+            if !active.monitor || self.preview.is_output_active() {
+                active.take.begin();
+            } else if !active.requested_playback {
+                self.preview.play();
+                active.requested_playback = true;
+            } else if !self.preview.is_playing() {
+                active.take.stop(true);
+                self.error("Monitor timeline", anyhow::anyhow!("The preview could not start. Record with timeline playback disabled or repair the preview error."));
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+
+    fn voiceover_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(setup) = &mut self.voiceover_setup {
+            let mut record = false;
+            let mut cancel = false;
+            let can_monitor = self.frame < self.project.duration();
+            egui::Modal::new(egui::Id::new("voiceover_setup")).show(ctx, |ui| {
+                ui.set_min_width(315.0);
+                ui.heading("Record voiceover");
+                egui::ComboBox::from_id_salt("voiceover_input")
+                    .selected_text(setup.device.as_deref().unwrap_or("Default microphone"))
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut setup.device, None, "Default microphone");
+                        for device in &setup.devices {
+                            ui.selectable_value(&mut setup.device, Some(device.clone()), device);
+                        }
+                    });
+                ui.add_enabled(
+                    can_monitor,
+                    egui::Checkbox::new(&mut setup.monitor, "Play timeline while recording"),
+                );
+                ui.label(format!("Insert at {}", timestamp(self.frame)));
+                ui.horizontal(|ui| {
+                    record = ui.button("Choose file and record…").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if cancel {
+                self.voiceover_setup = None;
+            } else if record {
+                let setup = self.voiceover_setup.take().expect("voiceover setup");
+                if let Some(destination) = self.choose_export_path(
+                    "Save voiceover recording",
+                    "Voiceover.wav",
+                    "WAV audio",
+                    "wav",
+                ) {
+                    self.stop_player();
+                    self.voiceover = Some(ActiveVoiceover {
+                        take: crate::voiceover::Recording::start(
+                            setup.device,
+                            destination,
+                            ctx.clone(),
+                        ),
+                        start: self.frame,
+                        row: self.selection.row,
+                        monitor: can_monitor && setup.monitor,
+                        requested_playback: false,
+                    });
+                } else {
+                    self.voiceover_setup = Some(setup);
+                }
+            }
+        }
+        if let Some(active) = &self.voiceover {
+            let take = &active.take;
+            let elapsed = take.elapsed();
+            egui::Window::new("Voiceover")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::RIGHT_TOP, [-18.0, 82.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(212.0);
+                    if take.finishing() {
+                        ui.spinner();
+                        ui.label("Closing recording…");
+                    } else if take.capturing() {
+                        ui.label(format!(
+                            "Recording  {:02}:{:02}.{:01}",
+                            elapsed.as_secs() / 60,
+                            elapsed.as_secs() % 60,
+                            elapsed.subsec_millis() / 100,
+                        ));
+                        ui.add(egui::ProgressBar::new(take.peak()).text("Input level"));
+                    } else {
+                        ui.spinner();
+                        ui.label(if take.ready() {
+                            "Buffering timeline…"
+                        } else {
+                            "Opening microphone…"
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                take.capturing() && elapsed >= Duration::from_millis(34),
+                                egui::Button::new("Stop and keep"),
+                            )
+                            .clicked()
+                        {
+                            take.stop(false);
+                        }
+                        if ui
+                            .add_enabled(!take.finishing(), egui::Button::new("Discard"))
+                            .clicked()
+                        {
+                            take.stop(true);
+                        }
+                    });
+                });
+        }
+    }
+
     fn set_document(&mut self, project: Project, file: Option<PathBuf>, imported: bool) {
+        self.autosave.clear();
+        self.draft_saved = false;
+        if imported {
+            self.autosave.mark_dirty();
+        }
         self.match_first_video = file.is_none() && !imported;
         self.preview.pause();
         self.preview.invalidate();
@@ -222,7 +443,11 @@ impl Editor {
     }
 
     fn select(&mut self, selection: Selection) {
+        self.multi_selection.clear();
         let new_clip = self.selection.clip != selection.clip;
+        if new_clip {
+            self.show_tracking_patch = false;
+        }
         self.selection = selection;
         self.last_live_edit = None;
         self.sync_selection();
@@ -241,6 +466,48 @@ impl Editor {
                 .is_none_or(|(edit, _)| self.project.tracks[edit.row].kind != TrackKind::Video)
         {
             self.inspector_tab = InspectorTab::Video;
+        }
+    }
+
+    fn toggle_clip_selection(&mut self, selection: Selection) {
+        let Some(id) = selection.clip.clone() else {
+            return;
+        };
+        let mut ids = std::mem::take(&mut self.multi_selection);
+        if let Some(primary) = &self.selection.clip {
+            ids.insert(primary.clone());
+        }
+        if !ids.remove(&id) {
+            ids.insert(id);
+            self.select(selection);
+        } else if let Some((row, clip)) = ids
+            .iter()
+            .find_map(|id| self.project.location(id).map(|(row, _)| (row, id.clone())))
+        {
+            self.select(Selection {
+                row,
+                clip: Some(clip),
+            });
+        } else {
+            self.select(Selection {
+                row: selection.row,
+                clip: None,
+            });
+        }
+        self.multi_selection = ids;
+    }
+
+    fn group_selection(&mut self) {
+        if self.multi_selection.len() < 2 {
+            return;
+        }
+        let ids = self.multi_selection.clone();
+        match self.commit(|project| project.group_clips(&ids)) {
+            Ok(()) => {
+                self.multi_selection.clear();
+                self.status = "Grouped clips. Drag any member to move the group.".into();
+            }
+            Err(error) => self.error("Group clips", error),
         }
     }
 
@@ -304,6 +571,26 @@ impl Editor {
         let mut updated = self.project.clone();
         let output = change(&mut updated)?;
         updated.validate()?;
+        if self.main_track_magnet
+            && let Some(row) = updated
+                .tracks
+                .iter()
+                .position(|track| track.kind == TrackKind::Video)
+            && updated.tracks[row]
+                .clips
+                .iter()
+                .map(|clip| (&clip.id, clip.start, clip.length))
+                .ne(self
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|track| track.kind == TrackKind::Video)
+                    .into_iter()
+                    .flat_map(|track| &track.clips)
+                    .map(|clip| (&clip.id, clip.start, clip.length)))
+        {
+            updated.close_track_gaps(row)?;
+        }
         if self.project != updated {
             let previous = std::mem::replace(&mut self.project, updated);
             if !coalesce {
@@ -319,6 +606,12 @@ impl Editor {
     }
 
     fn changed(&mut self) {
+        if self.is_dirty() {
+            self.autosave.mark_dirty();
+        } else {
+            self.autosave.clear();
+            self.draft_saved = false;
+        }
         self.preview.invalidate();
         let duration = self.project.duration();
         if duration == 0 {
@@ -359,6 +652,9 @@ impl Editor {
             Ok(project) => {
                 let is_template = path.extension().is_some_and(|ext| ext == "cutad-template");
                 self.status = format!("Opened {}.", project.name);
+                if !is_template && let Ok(recent) = recovery::remember_project(&path) {
+                    self.recent_projects = recent;
+                }
                 self.set_document(project, (!is_template).then_some(path), is_template);
             }
             Err(error) => self.error("Open project", error),
@@ -392,7 +688,12 @@ impl Editor {
             Ok(()) => {
                 self.status = format!("Saved {}.", filename(&path));
                 self.saved = self.project.clone();
+                if let Ok(recent) = recovery::remember_project(&path) {
+                    self.recent_projects = recent;
+                }
                 self.file = Some(path);
+                self.autosave.clear();
+                self.draft_saved = false;
             }
             Err(error) => self.error("Save project", error),
         }
@@ -408,6 +709,61 @@ impl Editor {
             match project::save(&project::as_template(&self.project), &path) {
                 Ok(()) => self.status = format!("Saved template {}.", filename(&path)),
                 Err(error) => self.error("Save template", error),
+            }
+        }
+    }
+
+    fn recovery_dialog(&mut self, ctx: &egui::Context) {
+        let Some(candidates) = &self.recovery_candidates else {
+            return;
+        };
+        let mut selected = None;
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("recover_draft")).show(ctx, |ui| {
+            ui.set_min_width(335.0);
+            ui.heading("Recover an autosaved draft");
+            if candidates.is_empty() {
+                ui.label("No recovery drafts are available.");
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(290.0)
+                    .show(ui, |ui| {
+                        for (index, candidate) in candidates.iter().enumerate() {
+                            let age = candidate.modified.elapsed().unwrap_or_default().as_secs();
+                            let age = if age < 60 {
+                                "Less than a minute ago".to_owned()
+                            } else if age < 3600 {
+                                format!("{} min ago", age / 60)
+                            } else if age < 86_400 {
+                                format!("{} h ago", age / 3600)
+                            } else {
+                                format!("{} d ago", age / 86_400)
+                            };
+                            ui.horizontal(|ui| {
+                                if ui.button(&candidate.name).clicked() {
+                                    selected = Some(index);
+                                }
+                                ui.label(RichText::new(age).small().color(MUTED));
+                            });
+                        }
+                    });
+            }
+            close = ui.button("Close").clicked();
+        });
+        if close {
+            self.recovery_candidates = None;
+        } else if let Some(index) = selected
+            && self.may_discard()
+        {
+            let choices = self.recovery_candidates.take().expect("recovery list");
+            match Autosave::recover(&choices[index]) {
+                Ok((autosave, project)) => {
+                    self.set_document(project, None, true);
+                    self.autosave = autosave;
+                    self.draft_saved = true;
+                    self.status = "Recovered a draft. Use Save to give it a project file.".into();
+                }
+                Err(error) => self.error("Recover draft", error),
             }
         }
     }
@@ -546,9 +902,15 @@ impl Editor {
 
     fn apply_placement(&mut self, placement: Placement, gain: f32) {
         let p = placement;
-        match self
-            .commit(|project| project.update_clip(&p.id, p.row, p.start, p.source, p.length, gain))
-        {
+        match self.commit(|project| {
+            let (row, index) = project.location(&p.id).context("Select a clip.")?;
+            let clip = &project.tracks[row].clips[index];
+            if clip.group_id.is_some() && p.source == clip.source && p.length == clip.length {
+                project.move_clip_group(&p.id, p.row, p.start)
+            } else {
+                project.update_clip(&p.id, p.row, p.start, p.source, p.length, gain)
+            }
+        }) {
             Ok(()) => self.select(Selection {
                 row: p.row,
                 clip: Some(p.id),
@@ -578,13 +940,19 @@ impl Editor {
         let Some(id) = self.selection.clip.clone() else {
             return;
         };
+        let selection = self.multi_selection.clone();
         let result = self.commit(|project| {
-            let (row, index) = project.location(&id).context("Select a clip first.")?;
-            project.tracks[row].clips.remove(index);
+            for track in &mut project.tracks {
+                track
+                    .clips
+                    .retain(|clip| clip.id != id && !selection.contains(&clip.id));
+            }
             Ok(())
         });
         if let Err(error) = result {
             self.error("Remove clip", error);
+        } else {
+            self.multi_selection.clear();
         }
     }
 
@@ -594,7 +962,104 @@ impl Editor {
         };
         match action {
             ClipAction::Split => self.split(),
+            ClipAction::Reverse => self.prepare_selected_clip(ctx, &id, MediaPreparation::Reverse),
+            ClipAction::InterpolateMotion => {
+                self.prepare_selected_clip(ctx, &id, MediaPreparation::InterpolateMotion)
+            }
+            ClipAction::Stabilize => {
+                self.prepare_selected_clip(ctx, &id, MediaPreparation::Stabilize)
+            }
+            ClipAction::RemoveBackground => {
+                self.prepare_selected_clip(ctx, &id, MediaPreparation::Cutout)
+            }
+            ClipAction::Freeze => {
+                let frame = self.frame;
+                let row = self.selection.row;
+                match self.commit(|project| project.insert_freeze(&id, frame, 3 * FPS)) {
+                    Ok(clip) => {
+                        self.select(Selection {
+                            row,
+                            clip: Some(clip),
+                        });
+                        self.status = "Inserted a 3-second freeze frame.".into();
+                    }
+                    Err(error) => self.error("Insert freeze frame", error),
+                }
+            }
+            ClipAction::SplitScenes => {
+                let Some((row, index)) = self.project.location(&id) else {
+                    return;
+                };
+                let clip = self.project.tracks[row].clips[index].clone();
+                let Some(path) = self
+                    .project
+                    .asset(&clip.asset_id)
+                    .and_then(|asset| asset.path.clone())
+                else {
+                    self.status = "Relink the video before detecting scenes.".into();
+                    return;
+                };
+                self.start_job(
+                    ctx,
+                    "Detecting scene changes",
+                    JobStyle::Cancellable,
+                    move |cancel, _| {
+                        let cuts = media::detect_scene_cuts(
+                            &path,
+                            clip.source,
+                            clip.length,
+                            cancel,
+                            |_| {},
+                        )?;
+                        Ok(Completed::Scenes(clip, cuts))
+                    },
+                );
+            }
             ClipAction::Remove => self.delete(),
+            ClipAction::CopySettings => {
+                let Some((row, index)) = self.project.location(&id) else {
+                    return;
+                };
+                let clip = &self.project.tracks[row].clips[index];
+                let (visual, audio) = Self::clip_setting_types(&self.project, row, clip);
+                if visual || audio {
+                    self.copied_clip_settings = Some(CopiedClipSettings {
+                        clip: clip.clone(),
+                        visual,
+                        audio,
+                    });
+                    self.status = "Copied clip settings.".into();
+                }
+            }
+            ClipAction::PasteSettings => {
+                let Some(settings) = self.copied_clip_settings.take() else {
+                    return;
+                };
+                let result = self.commit(|project| {
+                    let (row, index) = project.location(&id).context("Select a clip.")?;
+                    let (visual, audio) =
+                        Self::clip_setting_types(project, row, &project.tracks[row].clips[index]);
+                    let (visual, audio) = (visual && settings.visual, audio && settings.audio);
+                    anyhow::ensure!(
+                        visual || audio,
+                        "The selected clip has no compatible settings."
+                    );
+                    project.tracks[row].clips[index].paste_settings(&settings.clip, visual, audio);
+                    Ok(())
+                });
+                self.copied_clip_settings = Some(settings);
+                match result {
+                    Ok(()) => self.status = "Pasted clip settings.".into(),
+                    Err(error) => self.error("Paste clip settings", error),
+                }
+            }
+            ClipAction::RippleDelete => match self.commit(|project| project.ripple_delete(&id)) {
+                Ok(frame) => {
+                    self.seek(frame.min(self.project.duration()));
+                    self.status = "Removed the clip and closed its span on this track.".into();
+                }
+                Err(error) => self.error("Ripple delete", error),
+            },
             ClipAction::Replace => self.replace_media(ctx, false),
             ClipAction::Effects => {
                 self.library = LibraryTab::Effects;
@@ -608,11 +1073,9 @@ impl Editor {
                     }
                     if matches!(action, ClipAction::TrimLeft) {
                         edit.start = self.frame;
-                        let frozen = self.project.location(&id).is_some_and(|(row, index)| {
-                            self.project.tracks[row].clips[index].freeze
-                        });
-                        if !frozen {
-                            edit.source += offset;
+                        if let Some((row, index)) = self.project.location(&id) {
+                            edit.source = self.project.tracks[row].clips[index]
+                                .source_frame_at(i64::from(offset));
                         }
                         edit.length -= offset;
                     } else {
@@ -633,6 +1096,7 @@ impl Editor {
                         .max()
                         .unwrap_or_default();
                     copy.id = project::new_id();
+                    copy.group_id = None;
                     let id = copy.id.clone();
                     track.clips.push(copy);
                     Ok((row, id))
@@ -645,6 +1109,10 @@ impl Editor {
                     Err(error) => self.error("Duplicate clip", error),
                 }
             }
+            ClipAction::Ungroup => match self.commit(|project| project.ungroup_clip(&id)) {
+                Ok(()) => self.status = "Ungrouped clips.".into(),
+                Err(error) => self.error("Ungroup clips", error),
+            },
             ClipAction::DetachAudio => {
                 let result = self.commit(|project| {
                     let (row, index) = project.location(&id).context("Select a clip.")?;
@@ -654,6 +1122,7 @@ impl Editor {
                     audio.transition = None;
                     audio.effects.retain(|effect| effect.preset.audio());
                     original.gain = 0.0;
+                    original.gain_animation = Default::default();
                     original.effects.retain(|effect| !effect.preset.audio());
                     let index = project.tracks.len();
                     let mut track = Track::new("Detached audio", TrackKind::Audio);
@@ -671,6 +1140,121 @@ impl Editor {
                 }
             }
         }
+    }
+
+    fn prepare_selected_clip(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        preparation: MediaPreparation,
+    ) {
+        let Some((row, index)) = self.project.location(id) else {
+            return;
+        };
+        let clip = self.project.tracks[row].clips[index].clone();
+        let Some(asset) = self.project.asset(&clip.asset_id).cloned() else {
+            return;
+        };
+        let (title, filename, operation) = match preparation {
+            MediaPreparation::Reverse => {
+                ("Save reversed clip", "Reversed clip.mkv", "Reversing clip")
+            }
+            MediaPreparation::InterpolateMotion => (
+                "Save interpolated clip",
+                "Optical flow.mkv",
+                "Generating in-between frames",
+            ),
+            MediaPreparation::Stabilize => (
+                "Save stabilized clip",
+                "Stabilized clip.mkv",
+                "Stabilizing camera motion",
+            ),
+            MediaPreparation::Cutout => (
+                "Save transparent cutout",
+                if asset.kind == AssetKind::Image {
+                    "Cutout.png"
+                } else {
+                    "Cutout.mkv"
+                },
+                "Removing background",
+            ),
+        };
+        let model = if matches!(preparation, MediaPreparation::Cutout) {
+            let Some(model) = choose_subject_model() else {
+                return;
+            };
+            Some(model)
+        } else {
+            None
+        };
+        let (kind, extension) = if filename.ends_with(".png") {
+            ("PNG image", "png")
+        } else {
+            ("Matroska media", "mkv")
+        };
+        let Some(path) = self.choose_export_path(title, filename, kind, extension) else {
+            return;
+        };
+        self.stop_player();
+        self.start_job(ctx, operation, JobStyle::Export, move |cancel, progress| {
+            let report = |value| progress.store(value, Ordering::Relaxed);
+            let (asset, subframe) = match preparation {
+                MediaPreparation::Reverse => {
+                    media::reverse_clip(&clip, &asset, &path, cancel, report)?
+                }
+                MediaPreparation::InterpolateMotion => {
+                    media::interpolate_clip_motion(&clip, &asset, &path, cancel, report)?
+                }
+                MediaPreparation::Stabilize => {
+                    media::stabilize_clip(&clip, &asset, &path, cancel, report)?
+                }
+                MediaPreparation::Cutout => {
+                    media::remove_background(
+                        &clip, &asset, &path, &subject_python(),
+                        &model.context("Choose a local U²-Net ONNX model.")?,
+                        cancel, report,
+                    ).context("Background removal needs Python with rembg[cpu] installed. Set CUTAD_CUTOUT_PYTHON to that interpreter if needed.")?
+                }
+            };
+            Ok(Completed::Prepared(preparation, clip, asset, subframe))
+        });
+    }
+
+    fn auto_reframe(&mut self, ctx: &egui::Context, clip: project::Clip) {
+        let Some(asset) = self.project.asset(&clip.asset_id).cloned() else {
+            return;
+        };
+        let Some(model) = choose_subject_model() else {
+            return;
+        };
+        let canvas = [self.project.width, self.project.height];
+        self.stop_player();
+        self.start_job(
+            ctx,
+            "Finding the subject",
+            JobStyle::Cancellable,
+            move |cancel, _| {
+                let (scale, animation) = media::reframe_subject(
+                    &clip,
+                    &asset,
+                    canvas,
+                    &subject_python(),
+                    &model,
+                    cancel,
+                )?;
+                Ok(Completed::Reframed(clip, canvas, scale, animation))
+            },
+        );
+    }
+
+    fn clip_setting_types(project: &Project, row: usize, clip: &project::Clip) -> (bool, bool) {
+        (
+            project.tracks[row].kind == TrackKind::Video,
+            !clip.freeze
+                && project
+                    .asset(&clip.asset_id)
+                    .is_some_and(|asset| asset.audio),
+        )
     }
 
     fn add_track(&mut self, kind: TrackKind) {
@@ -709,7 +1293,14 @@ impl Editor {
         ctx.request_repaint();
     }
 
-    fn export(&mut self, ctx: &egui::Context, path: PathBuf, settings: Output) {
+    fn export(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        settings: Output,
+        range: std::ops::Range<u32>,
+        details: media::ExportDetails,
+    ) {
         if self
             .file
             .as_ref()
@@ -727,9 +1318,15 @@ impl Editor {
             "Exporting video",
             JobStyle::Export,
             move |cancel, progress| {
-                media::render_with(&snapshot, &path, settings, cancel, |value| {
-                    progress.store(value, Ordering::Relaxed)
-                })?;
+                media::render_with_details(
+                    &snapshot,
+                    &path,
+                    settings,
+                    range,
+                    &details,
+                    cancel,
+                    |value| progress.store(value, Ordering::Relaxed),
+                )?;
                 Ok(Completed::Export(path))
             },
         );
@@ -840,10 +1437,14 @@ impl Editor {
                     let (row, index) = project
                         .location(&id)
                         .context("The clip is no longer available.")?;
-                    let source = project.tracks[row].clips[index].source;
+                    let clip = &project.tracks[row].clips[index];
+                    let source = clip.source;
+                    let subframe = clip.source_subframe;
                     project.replace_media(&id, asset)?;
                     if keep_source {
-                        project.tracks[row].clips[index].source = source;
+                        let clip = &mut project.tracks[row].clips[index];
+                        clip.source = source;
+                        clip.source_subframe = subframe;
                     }
                     Ok(())
                 });
@@ -867,6 +1468,222 @@ impl Editor {
             Completed::CaptionExport(path, count) => {
                 self.status = format!("Exported {count} captions to {}.", filename(&path));
             }
+            Completed::Prepared(preparation, original, asset, subframe) => {
+                let label = asset.label.clone();
+                let result = self.commit(move |project| {
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The selected clip is no longer available.")?;
+                    anyhow::ensure!(
+                        project.tracks[row].clips[index] == original,
+                        "The clip changed while preparing its new media."
+                    );
+                    project.replace_media(&original.id, asset)?;
+                    project.tracks[row].clips[index].source_subframe = subframe;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => {
+                        self.status = match preparation {
+                            MediaPreparation::Reverse => format!("Reversed clip using {label}."),
+                            MediaPreparation::InterpolateMotion => {
+                                format!("Applied 120 fps optical flow using {label}.")
+                            }
+                            MediaPreparation::Stabilize => {
+                                format!("Stabilized clip using {label}.")
+                            }
+                            MediaPreparation::Cutout => {
+                                format!("Removed the background and saved {label}.")
+                            }
+                        }
+                    }
+                    Err(error) => self.error("Apply prepared media", error),
+                }
+            }
+            Completed::Loudness(original, gain, lufs) => {
+                let has_keyframes = !original.gain_animation.is_empty();
+                let result = self.commit(|project| {
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The analyzed clip is no longer available.")?;
+                    let clip = &mut project.tracks[row].clips[index];
+                    anyhow::ensure!(*clip == original, "The clip changed during analysis.");
+                    if has_keyframes {
+                        for key in &mut clip.gain_animation.keys {
+                            key.value = (key.value * gain).min(4.0);
+                        }
+                    } else {
+                        clip.gain = gain;
+                    }
+                    Ok(())
+                });
+                match result {
+                    Ok(()) if has_keyframes => {
+                        self.status = format!(
+                            "Scaled gain keyframes by {gain:.2}×. Estimated loudness {lufs:.1} LUFS."
+                        );
+                    }
+                    Ok(()) => {
+                        self.status =
+                            format!("Set gain to {gain:.2}×. Estimated loudness {lufs:.1} LUFS.")
+                    }
+                    Err(error) => self.error("Normalize loudness", error),
+                }
+            }
+            Completed::ColorSuggested(original, adjustment, matched) => {
+                let result = self.commit(|project| {
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The analyzed clip is no longer available.")?;
+                    let clip = &mut project.tracks[row].clips[index];
+                    anyhow::ensure!(*clip == original, "The clip changed during analysis.");
+                    clip.adjustment = adjustment;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) if matched => self.status = "Applied the reference tone.".into(),
+                    Ok(()) => self.status = "Applied automatic color correction.".into(),
+                    Err(error) => self.error("Apply color correction", error),
+                }
+            }
+            Completed::Reframed(original, canvas, scale, animation) => {
+                let result = self.commit(|project| {
+                    anyhow::ensure!(
+                        [project.width, project.height] == canvas,
+                        "The canvas changed during analysis."
+                    );
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The analyzed clip is no longer available.")?;
+                    let clip = &mut project.tracks[row].clips[index];
+                    anyhow::ensure!(*clip == original, "The clip changed during analysis.");
+                    clip.transform.scale = scale;
+                    clip.scale_animation = Default::default();
+                    clip.position_animation = animation;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => {
+                        self.status =
+                            "Reframed the subject and added editable position keyframes.".into()
+                    }
+                    Err(error) => self.error("Apply auto reframe", error),
+                }
+            }
+            Completed::Voiceover(asset, start, preferred_row) => {
+                let media_id = asset.id.clone();
+                let label = asset.label.clone();
+                let end = start.saturating_add(asset.frames);
+                let result = self.commit(|project| {
+                    let accepts = |track: &Track| {
+                        track.kind == TrackKind::Audio
+                            && !track.muted
+                            && track
+                                .clips
+                                .iter()
+                                .all(|clip| start >= clip.end() || end <= clip.start)
+                    };
+                    let row = if project.tracks.get(preferred_row).is_some_and(accepts) {
+                        preferred_row
+                    } else if let Some(row) = project.tracks.iter().position(accepts) {
+                        row
+                    } else {
+                        project
+                            .tracks
+                            .push(Track::new("Voiceover", TrackKind::Audio));
+                        project.tracks.len() - 1
+                    };
+                    project.assets.push(asset);
+                    let id = project.insert_asset(row, &media_id, start)?;
+                    Ok((row, id))
+                });
+                match result {
+                    Ok((row, id)) => {
+                        self.asset_id = Some(media_id);
+                        self.select(Selection {
+                            row,
+                            clip: Some(id),
+                        });
+                        self.seek(start);
+                        self.status = format!("Added {label} at {}.", timestamp(start));
+                    }
+                    Err(error) => self.error("Add saved voiceover", error),
+                }
+            }
+            Completed::Beats(original, positions) => {
+                if positions.is_empty() {
+                    self.status = "No consistent beat was detected in this clip.".into();
+                    return;
+                }
+                let result = self.commit(|project| {
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The analyzed clip is no longer available.")?;
+                    anyhow::ensure!(
+                        project.tracks[row].clips[index] == original,
+                        "The clip changed during analysis."
+                    );
+                    let mut added = 0;
+                    for position in positions {
+                        if project
+                            .markers
+                            .binary_search_by_key(&position, |marker| marker.frame)
+                            .is_err()
+                        {
+                            project.set_marker(position, "Beat")?;
+                            added += 1;
+                        }
+                    }
+                    Ok(added)
+                });
+                match result {
+                    Ok(0) => self.status = "Beat markers are already present.".into(),
+                    Ok(added) => self.status = format!("Added {added} beat markers."),
+                    Err(error) => self.error("Add beat markers", error),
+                }
+            }
+            Completed::Tracked(original, animation) => {
+                let points = animation.keys.len();
+                let result = self.commit(|project| {
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The overlay is no longer available.")?;
+                    let clip = &mut project.tracks[row].clips[index];
+                    anyhow::ensure!(*clip == original, "The overlay changed during tracking.");
+                    clip.position_animation = animation;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => self.status = format!("Added {points} tracking keyframes."),
+                    Err(error) => self.error("Apply motion tracking", error),
+                }
+            }
+            Completed::Scenes(original, cuts) => {
+                if cuts.is_empty() {
+                    self.status = "No hard scene changes found.".into();
+                    return;
+                }
+                let result = self.commit(|project| {
+                    let (row, index) = project
+                        .location(&original.id)
+                        .context("The scanned clip is no longer available.")?;
+                    anyhow::ensure!(
+                        project.tracks[row].clips[index] == original,
+                        "The clip changed during the scan."
+                    );
+                    let mut tail = original.id.clone();
+                    for offset in &cuts {
+                        tail = project.split(&tail, original.start + offset)?;
+                    }
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => {
+                        self.status = format!("Split the clip into {} scenes.", cuts.len() + 1)
+                    }
+                    Err(error) => self.error("Split at scene changes", error),
+                }
+            }
 
             Completed::Subtitles(cues) => {
                 let result = self.commit(|project| cutad::subtitles::add_tracks(project, cues));
@@ -874,6 +1691,16 @@ impl Editor {
                 if let Some((placement, _)) = &self.edit {
                     self.seek(placement.start);
                 }
+            }
+            Completed::EnglishSubtitles(english, original) => {
+                let result = self.commit(|project| {
+                    let bilingual = original.is_some();
+                    if let Some(original) = original {
+                        cutad::subtitles::add_tracks(project, original)?;
+                    }
+                    cutad::subtitles::add_english_tracks(project, english, bilingual)
+                });
+                self.select_inserted(result, "Added translated captions");
             }
 
             Completed::MatchCanvas(id, geometry) => {
@@ -925,6 +1752,33 @@ impl Editor {
                     ui.close();
                     self.open();
                 }
+                let mut recent = None;
+                ui.add_enabled_ui(!self.recent_projects.is_empty(), |ui| {
+                    ui.menu_button("Open recent", |ui| {
+                        for path in &self.recent_projects {
+                            if ui
+                                .button(filename(path))
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                recent = Some(path.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                if let Some(path) = recent
+                    && self.may_discard()
+                {
+                    self.open_path(path);
+                }
+                if ui.button("Recover autosaved draft…").clicked() {
+                    ui.close();
+                    match recovery::candidates() {
+                        Ok(candidates) => self.recovery_candidates = Some(candidates),
+                        Err(error) => self.error("Find recovery drafts", error),
+                    }
+                }
                 if ui.button("Save").clicked() {
                     ui.close();
                     self.save(false);
@@ -944,16 +1798,19 @@ impl Editor {
                     ui.close();
                     self.export_still(ui.ctx());
                 }
-                if ui
-                    .add_enabled(
-                        cutad::transcription::has_audible_clip(&self.project),
-                        egui::Button::new("Export audio…"),
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.export_audio(ui.ctx());
-                }
+                ui.add_enabled_ui(
+                    cutad::transcription::has_audible_clip(&self.project),
+                    |ui| {
+                        ui.menu_button("Export audio", |ui| {
+                            for format in media::AudioFormat::ALL {
+                                if ui.button(format.label()).clicked() {
+                                    ui.close();
+                                    self.export_audio(ui.ctx(), format);
+                                }
+                            }
+                        });
+                    },
+                );
                 ui.separator();
                 if ui
                     .checkbox(&mut self.reduced_motion, "Reduce interface motion")
@@ -983,7 +1840,17 @@ impl Editor {
                     .add_enabled(self.project.duration() > 0, export)
                     .clicked()
                 {
-                    self.export_dialog = Some(ExportDialog::new(&self.project));
+                    let selection = self
+                        .selection
+                        .clip
+                        .as_deref()
+                        .and_then(|id| self.project.location(id))
+                        .map(|(row, index)| {
+                            let clip = &self.project.tracks[row].clips[index];
+                            clip.start..clip.end()
+                        });
+                    self.export_dialog =
+                        Some(ExportDialog::new(&self.project, selection, self.frame));
                 }
             });
         });
@@ -1134,7 +2001,7 @@ impl Editor {
         Some(path)
     }
 
-    fn export_captions(&mut self, ctx: &egui::Context) {
+    fn export_captions(&mut self, ctx: &egui::Context, row: Option<usize>) {
         let Some(path) = self.choose_export_path(
             "Export captions",
             "CutAd captions.srt",
@@ -1145,7 +2012,10 @@ impl Editor {
         };
         let project = self.project.clone();
         self.start_job(ctx, "Exporting captions", JobStyle::Read, move |_, _| {
-            let count = cutad::subtitles::write(&project, &path)?;
+            let count = match row {
+                Some(row) => cutad::subtitles::write_track(&project, &path, row)?,
+                None => cutad::subtitles::write(&project, &path)?,
+            };
             Ok(Completed::CaptionExport(path, count))
         });
     }
@@ -1176,10 +2046,14 @@ impl Editor {
         );
     }
 
-    fn export_audio(&mut self, ctx: &egui::Context) {
-        let Some(path) =
-            self.choose_export_path("Export audio", "CutAd audio.wav", "WAV audio", "wav")
-        else {
+    fn export_audio(&mut self, ctx: &egui::Context, format: media::AudioFormat) {
+        let extension = format.extension();
+        let Some(path) = self.choose_export_path(
+            "Export audio",
+            &format!("CutAd audio.{extension}"),
+            format.label(),
+            extension,
+        ) else {
             return;
         };
         self.stop_player();
@@ -1189,7 +2063,7 @@ impl Editor {
             "Exporting audio",
             JobStyle::Export,
             move |cancel, progress| {
-                media::render_audio_master(&project, &path, cancel, |value| {
+                media::export_audio(&project, &path, format, cancel, |value| {
                     progress.store(value, Ordering::Relaxed)
                 })?;
                 Ok(Completed::Export(path))
@@ -1197,7 +2071,7 @@ impl Editor {
         );
     }
 
-    fn auto_captions(&mut self, ctx: &egui::Context) {
+    fn auto_captions(&mut self, ctx: &egui::Context, translate: bool, bilingual: bool) {
         if !cutad::transcription::has_audible_clip(&self.project) {
             self.status = "Add audible media before generating captions.".into();
             return;
@@ -1207,7 +2081,11 @@ impl Editor {
             return;
         }
         let Some(model) = FileDialog::new()
-            .set_title("Select a local whisper.cpp model")
+            .set_title(if translate {
+                "Select a multilingual whisper.cpp model"
+            } else {
+                "Select a local whisper.cpp model"
+            })
             .add_filter("Whisper model", &["bin"])
             .pick_file()
         else {
@@ -1217,11 +2095,27 @@ impl Editor {
         let project = self.project.clone();
         self.start_job(
             ctx,
-            "Generating captions",
+            if translate {
+                "Translating captions to English"
+            } else {
+                "Generating captions"
+            },
             JobStyle::Cancellable,
             move |cancel, _| {
-                let cues = cutad::transcription::generate(&project, &model, cancel)?;
-                Ok(Completed::Subtitles(cues))
+                if translate {
+                    let english =
+                        cutad::transcription::translate_to_english(&project, &model, cancel)?;
+                    let original = if bilingual {
+                        Some(cutad::transcription::generate(&project, &model, cancel)?)
+                    } else {
+                        None
+                    };
+                    Ok(Completed::EnglishSubtitles(english, original))
+                } else {
+                    Ok(Completed::Subtitles(cutad::transcription::generate(
+                        &project, &model, cancel,
+                    )?))
+                }
             },
         );
     }
@@ -1241,20 +2135,41 @@ impl Editor {
                     Ok(Completed::Subtitles(cutad::subtitles::read(&path)?))
                 });
             }
-            if ui.button("Export captions…").clicked() {
-                self.export_captions(ui.ctx());
-            }
+            ui.menu_button("Export captions…", |ui| {
+                if ui.button("All visible captions").clicked() {
+                    ui.close();
+                    self.export_captions(ui.ctx(), None);
+                }
+                if ui.button("Selected track only").clicked() {
+                    ui.close();
+                    self.export_captions(ui.ctx(), Some(self.selection.row));
+                }
+            });
             if ui
                 .button("Auto captions…")
                 .on_hover_text("Generate offline with whisper.cpp and a local model")
                 .clicked()
             {
-                self.auto_captions(ui.ctx());
+                self.auto_captions(ui.ctx(), false, false);
+            }
+            if ui.button("Translate speech to English…").clicked() {
+                self.auto_captions(ui.ctx(), true, false);
+            }
+            if ui.button("Original and English captions…").clicked() {
+                self.auto_captions(ui.ctx(), true, true);
             }
             if ui.button("Browse fonts…").clicked() {
                 self.open_fonts(ui.ctx());
             }
         });
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.show_transcript, false, "Text presets");
+            ui.selectable_value(&mut self.show_transcript, true, "Transcript");
+        });
+        if self.show_transcript {
+            self.transcript_panel(ui);
+            return;
+        }
         egui::ScrollArea::vertical()
             .id_salt("title_templates")
             .show(ui, |ui| {
@@ -1276,6 +2191,92 @@ impl Editor {
             });
     }
 
+    fn transcript_panel(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Export transcript…").clicked()
+            && let Some(path) = self.choose_export_path(
+                "Export transcript",
+                "CutAd transcript.txt",
+                "Plain text",
+                "txt",
+            )
+        {
+            let project = self.project.clone();
+            self.start_job(
+                ui.ctx(),
+                "Exporting transcript",
+                JobStyle::Read,
+                move |_, _| {
+                    let count = cutad::subtitles::write_transcript(&project, &path)?;
+                    Ok(Completed::CaptionExport(path, count))
+                },
+            );
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.transcript_query)
+                .hint_text("Search captions")
+                .desired_width(f32::INFINITY),
+        );
+        let captions = cutad::subtitles::caption_clips(&self.project, &self.transcript_query);
+        if captions.is_empty() {
+            ui.label(if self.transcript_query.trim().is_empty() {
+                "Import or generate captions to see them here."
+            } else {
+                "No matching captions."
+            });
+            return;
+        }
+        let mut selected = None;
+        let mut remove_range = None;
+        egui::ScrollArea::vertical()
+            .id_salt("caption_transcript")
+            .show_rows(ui, 33.0, captions.len(), |ui, rows| {
+                for index in rows {
+                    let (clip, text) = captions[index];
+                    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let label = format!("{}  {text}", timestamp(clip.start));
+                    let active = self.selection.clip.as_deref() == Some(clip.id.as_str());
+                    let response = ui
+                        .add_sized(
+                            [ui.available_width(), 33.0],
+                            egui::Button::new(label).selected(active).truncate(),
+                        )
+                        .on_hover_text(text);
+                    if response.clicked() {
+                        selected = Some((clip.id.clone(), clip.start));
+                    }
+                    response.context_menu(|ui| {
+                        if ui
+                            .button("Remove this time range from all tracks")
+                            .clicked()
+                        {
+                            remove_range = Some((clip.start, clip.end()));
+                            ui.close();
+                        }
+                    });
+                }
+            });
+        if let Some((start, end)) = remove_range {
+            match self.commit(|project| project.ripple_delete_range(start, end)) {
+                Ok(()) => {
+                    self.seek(start);
+                    self.status = format!("Removed {} from all tracks.", timestamp(end - start));
+                }
+                Err(error) => self.error("Remove transcript range", error),
+            }
+            return;
+        }
+        if let Some((id, start)) = selected
+            && let Some((row, _)) = self.project.location(&id)
+        {
+            self.select(Selection {
+                row,
+                clip: Some(id),
+            });
+            self.inspector_tab = InspectorTab::Text;
+            self.seek(start);
+        }
+    }
+
     fn select_inserted(&mut self, result: Result<String>, action: &str) {
         match result {
             Ok(id) => {
@@ -1294,17 +2295,13 @@ impl Editor {
 
     fn stickers_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Stickers");
-        ui.label(
-            RichText::new(
-                "Add your own image at the playhead. PNG and WebP preserve transparency.",
-            )
-            .color(MUTED),
-        );
+        ui.label(RichText::new("Add an image or animated GIF at the playhead.").color(MUTED));
         if ui
             .button(RichText::new("Import sticker…").strong())
             .clicked()
             && let Some(path) = FileDialog::new()
                 .add_filter("Still images", IMAGE_FILES)
+                .add_filter("Animated GIF", &["gif"])
                 .pick_file()
         {
             self.import_sticker(ui.ctx(), path);
@@ -1376,10 +2373,12 @@ impl Editor {
 
     fn templates_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Templates");
-        for (name, detail) in [
-            (TEMPLATES[0], "9:16  •  3 media slots"),
-            (TEMPLATES[1], "16:9  •  3 media slots"),
-        ] {
+        for (name, detail) in TEMPLATES.into_iter().zip([
+            "9:16 · 3 media slots",
+            "16:9 · 3 media slots",
+            "16:9 · 2 panels and a title",
+            "9:16 · 2 media slots and a reveal transition",
+        ]) {
             let width = ui.available_width();
             egui::Frame::new()
                 .fill(BACK)
@@ -1735,6 +2734,39 @@ impl Editor {
             ui.label("Select a title on the timeline.");
             return;
         };
+        if let Some((placement, _)) = &self.edit {
+            let (start, row) = (placement.start, placement.row);
+            let mut selected_voice = None;
+            ui.menu_button("Generate narration…", |ui| {
+                for (label, voice) in [
+                    ("English", "en"),
+                    ("Portuguese (Brazil)", "pt-br"),
+                    ("Spanish", "es"),
+                    ("French", "fr"),
+                ] {
+                    if ui.button(label).clicked() {
+                        selected_voice = Some(voice);
+                        ui.close();
+                    }
+                }
+            });
+            if let Some(voice) = selected_voice
+                && let Some(path) =
+                    self.choose_export_path("Save narration", "Narration.wav", "WAV audio", "wav")
+            {
+                let text = title.text.clone();
+                self.stop_player();
+                self.start_job(
+                    ui.ctx(),
+                    "Generating narration",
+                    JobStyle::Read,
+                    move |_, _| {
+                        let asset = media::synthesize_narration(&text, voice, &path)?;
+                        Ok(Completed::Voiceover(asset, start, row))
+                    },
+                );
+            }
+        }
         if crate::typography::font_picker(ui, title.appearance.font.as_ref()) {
             self.open_fonts(ui.ctx());
         }
@@ -1772,6 +2804,16 @@ impl Editor {
             return;
         };
         let clip = &self.project.tracks[row].clips[index];
+        if !clip.freeze
+            && !clip.slot
+            && self.project.asset(&clip.asset_id).is_some_and(|asset| {
+                matches!(asset.kind, AssetKind::Video | AssetKind::Image)
+            })
+            && ui.button("Auto reframe…").on_hover_text("Fit the current canvas and replace scale and position animation with subject framing").clicked()
+        {
+            self.auto_reframe(ui.ctx(), clip.clone());
+            return;
+        }
         let fade = clip.visual_fade;
         let mut fades = [fade.in_frames, fade.out_frames];
         let mut apply_preset = false;
@@ -1789,6 +2831,26 @@ impl Editor {
         });
         ui.separator();
         ui.heading("Position keyframes");
+        let mut easing = clip.position_animation.easing;
+        let mut slide = None;
+        if clip.position_animation.is_empty() && clip.length > 1 {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Slide in from left").clicked() {
+                    slide = Some(-1.5);
+                }
+                if ui.button("Slide in from right").clicked() {
+                    slide = Some(1.5);
+                }
+            });
+        } else if !clip.position_animation.is_empty() {
+            egui::ComboBox::from_id_salt("position_easing")
+                .selected_text(easing.label())
+                .show_ui(ui, |ui| {
+                    for option in project::Easing::ALL {
+                        ui.selectable_value(&mut easing, option, option.label());
+                    }
+                });
+        }
         let in_clip = (clip.start..clip.end()).contains(&self.frame);
         let local = self.frame.saturating_sub(clip.start).min(clip.length - 1);
         let mut position = clip.position_at(local);
@@ -1851,7 +2913,24 @@ impl Editor {
                 }
             }
         }
-        if let Some(frame) = jumped {
+        if let Some(x) = slide {
+            let result = self.commit(|project| {
+                let (row, index) = project.location(&id).context("Select a clip.")?;
+                let clip = &mut project.tracks[row].clips[index];
+                let [end_x, y] = [clip.transform.x, clip.transform.y];
+                clip.set_position_keyframe(0, [x, y])?;
+                clip.set_position_keyframe((FPS / 2).min(clip.length - 1), [end_x, y])?;
+                clip.position_animation.easing = project::Easing::EaseOut;
+                Ok(())
+            });
+            if let Err(error) = result {
+                self.error("Apply slide animation", error);
+            }
+        } else if easing != clip.position_animation.easing {
+            self.update_selected_clip(LiveControl::Motion, |clip| {
+                clip.position_animation.easing = easing;
+            });
+        } else if let Some(frame) = jumped {
             self.seek(frame);
         } else if remove {
             self.last_live_edit = None;
@@ -1885,6 +2964,167 @@ impl Editor {
                 clip.set_visual_fade(fades[0], fades[1]);
             });
         }
+        self.scalar_keyframes(ui, &id, project::AnimatedProperty::Opacity);
+        self.scalar_keyframes(ui, &id, project::AnimatedProperty::Rotation);
+        self.scalar_keyframes(ui, &id, project::AnimatedProperty::Scale);
+        self.tracking_controls(ui, &id);
+    }
+
+    fn tracking_controls(&mut self, ui: &mut egui::Ui, id: &str) {
+        let Some((row, index)) = self.project.location(id) else {
+            return;
+        };
+        if !self.project.tracks[..row]
+            .iter()
+            .any(|track| track.kind == TrackKind::Video && !track.muted && !track.clips.is_empty())
+        {
+            return;
+        }
+        ui.separator();
+        ui.collapsing("Motion tracking", |ui| {
+            let clip = self.project.tracks[row].clips[index].clone();
+            ui.label("Choose a patch in the footage beneath the overlay’s first frame.");
+            if ui.button("Go to first frame").clicked() {
+                self.seek(clip.start);
+                self.show_tracking_patch = true;
+            }
+            ui.checkbox(&mut self.show_tracking_patch, "Show tracking patch");
+            let seed = &mut self.tracking_seed;
+            egui::Grid::new("tracking_patch").show(ui, |ui| {
+                for (label, value, bounds) in [
+                    ("Center X", &mut seed.x, 0..=100),
+                    ("Center Y", &mut seed.y, 0..=100),
+                    ("Patch size", &mut seed.size, 5..=35),
+                ] {
+                    ui.label(label);
+                    ui.add(egui::DragValue::new(value).range(bounds).suffix("%"));
+                    ui.end_row();
+                }
+            });
+            if ui
+                .button("Track position")
+                .on_hover_text("Create new position keyframes for this overlay.")
+                .clicked()
+            {
+                let seed = *seed;
+                let snapshot = self.project.clone();
+                self.start_job(
+                    ui.ctx(),
+                    "Tracking motion",
+                    JobStyle::Cancellable,
+                    move |cancel, _| {
+                        let animation =
+                            cutad::tracking::track_overlay(snapshot, &clip.id, seed, cancel)?;
+                        Ok(Completed::Tracked(clip, animation))
+                    },
+                );
+            }
+        });
+    }
+
+    fn scalar_keyframes(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        property: project::AnimatedProperty,
+    ) {
+        let Some((row, index)) = self.project.location(id) else {
+            return;
+        };
+        let clip = &self.project.tracks[row].clips[index];
+        let local = self.frame.saturating_sub(clip.start).min(clip.length - 1);
+        let in_clip = (clip.start..clip.end()).contains(&self.frame);
+        let (control, factor, range, unit) = match property {
+            project::AnimatedProperty::Opacity => {
+                (LiveControl::OpacityAnimation, 100.0, 0.0..=100.0, "%")
+            }
+            project::AnimatedProperty::Rotation => {
+                (LiveControl::RotationAnimation, 1.0, -180.0..=180.0, "°")
+            }
+            project::AnimatedProperty::Scale => (
+                LiveControl::ScaleAnimation,
+                100.0,
+                10.0..=project::MAX_CLIP_SCALE * 100.0,
+                "%",
+            ),
+            project::AnimatedProperty::AudioGain => {
+                (LiveControl::AudioGainAnimation, 100.0, 0.0..=400.0, "%")
+            }
+        };
+        let original = clip.animated_value(property, local) * factor;
+        let mut value = original;
+        let keyed = clip
+            .animation(property)
+            .times(clip.length)
+            .any(|time| time == local);
+        let original_easing = clip.animation(property).easing;
+        let mut easing = original_easing;
+        let mut add = false;
+        let mut remove = false;
+        ui.separator();
+        ui.heading(format!("{} keyframes", property.label()));
+        if !clip.animation(property).is_empty() {
+            egui::ComboBox::from_id_salt(("scalar_easing", property.label()))
+                .selected_text(easing.label())
+                .show_ui(ui, |ui| {
+                    for option in project::Easing::ALL {
+                        ui.selectable_value(&mut easing, option, option.label());
+                    }
+                });
+        }
+        let static_audio =
+            property == project::AnimatedProperty::AudioGain && clip.gain_animation.is_empty();
+        ui.add_enabled_ui(in_clip || static_audio, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(property.label());
+                ui.add(
+                    egui::DragValue::new(&mut value)
+                        .range(range)
+                        .suffix(unit)
+                        .fixed_decimals(0),
+                );
+                add = ui
+                    .add_enabled(in_clip && !keyed, egui::Button::new("Add keyframe"))
+                    .clicked();
+                remove = ui
+                    .add_enabled(keyed, egui::Button::new("Remove keyframe"))
+                    .clicked();
+            });
+        });
+        let seek = clip
+            .animation(property)
+            .times(clip.length)
+            .map(|time| clip.start + time)
+            .find(|&time| {
+                ui.selectable_label(time == self.frame, timestamp(time))
+                    .clicked()
+            });
+        if let Some(frame) = seek {
+            self.seek(frame);
+        } else if easing != original_easing {
+            self.update_selected_clip(control, |clip| clip.set_scalar_easing(property, easing));
+        } else if remove {
+            self.last_live_edit = None;
+            self.update_selected_clip(control, |clip| clip.remove_scalar_keyframe(property, local));
+            self.last_live_edit = None;
+        } else if add || value != original {
+            if add {
+                self.last_live_edit = None;
+            }
+            let result = self.commit_live(control, |project| {
+                let (row, index) = project.location(id).context("Select a clip.")?;
+                let clip = &mut project.tracks[row].clips[index];
+                if add || !clip.animation(property).is_empty() {
+                    clip.set_scalar_keyframe(property, local, value / factor)?;
+                } else {
+                    clip.set_static_value(property, value / factor);
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                self.error("Edit keyframe", error);
+            }
+        }
     }
 
     fn color_inspector(&mut self, ui: &mut egui::Ui) {
@@ -1901,7 +3141,63 @@ impl Editor {
         };
         let mut grade = clip.adjustment;
         let mut chroma = clip.chroma_key;
+        let mut lut = clip.color_lut.clone();
+        let mut hue_ranges = clip.hue_adjustments;
         ui.heading("Color correction");
+        if let Some(asset) = self
+            .project
+            .asset(&clip.asset_id)
+            .filter(|asset| !clip.slot && matches!(asset.kind, AssetKind::Video | AssetKind::Image))
+        {
+            let mut auto = false;
+            let mut match_tone = false;
+            ui.horizontal_wrapped(|ui| {
+                auto = ui
+                    .button("Auto color")
+                    .on_hover_text(
+                        "Set brightness, contrast, and saturation from the playhead frame",
+                    )
+                    .clicked();
+                match_tone = ui
+                    .button("Match tone…")
+                    .on_hover_text(
+                        "Match brightness, contrast, and saturation to a local image or video",
+                    )
+                    .clicked();
+            });
+            if auto || match_tone {
+                let reference = if match_tone {
+                    let Some(path) = FileDialog::new()
+                        .set_title("Choose a reference image or video")
+                        .add_filter("Images", IMAGE_FILES)
+                        .add_filter("Videos", VIDEO_FILES)
+                        .pick_file()
+                    else {
+                        return;
+                    };
+                    Some(path)
+                } else {
+                    None
+                };
+                let clip = clip.clone();
+                let asset = asset.clone();
+                let local = self.frame.saturating_sub(clip.start).min(clip.length - 1);
+                let source = (clip.source_units_at(i64::from(local)) / 100) as u32;
+                self.stop_player();
+                self.start_job(
+                    ui.ctx(),
+                    "Analyzing color",
+                    JobStyle::Cancellable,
+                    move |cancel, _| {
+                        let reference = reference.as_deref().map(media::probe).transpose()?;
+                        let grade =
+                            media::suggest_color(&asset, source, reference.as_ref(), cancel)?;
+                        Ok(Completed::ColorSuggested(clip, grade, reference.is_some()))
+                    },
+                );
+                return;
+            }
+        }
         egui::Grid::new("color_correction")
             .num_columns(2)
             .show(ui, |ui| {
@@ -1918,6 +3214,58 @@ impl Editor {
         if ui.small_button("Reset color").clicked() {
             grade = ColorAdjustment::default();
         }
+        ui.collapsing("Hue, saturation, and intensity", |ui| {
+            let id = ui.make_persistent_id("selected_hue_range");
+            let mut selected = ui
+                .data(|data| data.get_temp::<usize>(id))
+                .unwrap_or_default();
+            egui::ComboBox::from_id_salt("hue_range")
+                .selected_text(project::HUE_RANGES[selected].0)
+                .show_ui(ui, |ui| {
+                    for (index, (label, _)) in project::HUE_RANGES.into_iter().enumerate() {
+                        ui.selectable_value(&mut selected, index, label);
+                    }
+                });
+            ui.data_mut(|data| data.insert_temp(id, selected));
+            let range = &mut hue_ranges[selected];
+            egui::Grid::new("hue_adjustments")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Hue");
+                    ui.add(
+                        egui::DragValue::new(&mut range.hue)
+                            .range(-180..=180)
+                            .suffix("°"),
+                    );
+                    ui.end_row();
+                    for (label, value) in [
+                        ("Saturation", &mut range.saturation),
+                        ("Intensity", &mut range.intensity),
+                    ] {
+                        ui.label(label);
+                        ui.add(egui::DragValue::new(value).range(-100..=100).suffix("%"));
+                        ui.end_row();
+                    }
+                });
+            if ui.small_button("Reset color ranges").clicked() {
+                hue_ranges = [project::HueAdjustment::default(); 6];
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Choose color LUT…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("3D color LUT", &["cube"])
+                    .pick_file()
+            {
+                lut = Some(path);
+            }
+            if let Some(path) = &lut {
+                ui.label(filename(path));
+                if ui.small_button("Remove LUT").clicked() {
+                    lut = None;
+                }
+            }
+        });
         ui.separator();
         if self.title.is_none() {
             let mut use_key = chroma.is_some();
@@ -1940,10 +3288,15 @@ impl Editor {
                 });
             }
         }
-        if (grade, chroma) != (clip.adjustment, clip.chroma_key) {
+        if (grade, chroma) != (clip.adjustment, clip.chroma_key)
+            || lut != clip.color_lut
+            || hue_ranges != clip.hue_adjustments
+        {
             self.update_selected_clip(LiveControl::Color, |clip| {
                 clip.adjustment = grade;
                 clip.chroma_key = chroma;
+                clip.color_lut = lut;
+                clip.hue_adjustments = hue_ranges;
             });
         }
     }
@@ -1961,6 +3314,23 @@ impl Editor {
             ui.label("Select a video, image, or text clip.");
             return;
         };
+        if !clip.freeze
+            && !clip.slot
+            && self
+                .project
+                .asset(&clip.asset_id)
+                .is_some_and(|asset| matches!(asset.kind, AssetKind::Video | AssetKind::Image))
+        {
+            if ui
+                .button("Remove background…")
+                .on_hover_text("Create a transparent copy using a local ONNX model")
+                .clicked()
+            {
+                self.clip_action(ui.ctx(), ClipAction::RemoveBackground);
+                return;
+            }
+            ui.separator();
+        }
         let before = clip.mask;
         let mut mask = before;
         let mut enabled = mask.is_some();
@@ -2038,20 +3408,64 @@ impl Editor {
             ui.label(RichText::new("This clip has no audio.").color(MUTED));
             return;
         }
-        let mut gain = clip.gain;
+        let original_pitch = clip.pitch_semitones;
+        let mut pitch = original_pitch;
+        let original_channels = (clip.audio_channels, clip.audio_balance);
+        let (mut channels, mut balance) = original_channels;
+        let id = id.to_owned();
         let original_fades = [clip.audio_fade.in_frames, clip.audio_fade.out_frames];
         let mut fades = original_fades;
-        ui.add(
-            egui::Slider::new(&mut gain, 0.0..=4.0)
-                .text("Clip gain")
-                .suffix("×"),
-        );
         Self::fade_controls(ui, "audio_fades", clip.length, &mut fades);
-        if gain != clip.gain || fades != original_fades {
+        ui.horizontal(|ui| {
+            ui.label("Pitch");
+            ui.add(
+                egui::DragValue::new(&mut pitch)
+                    .range(-12..=12)
+                    .suffix(" semitones"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Channels");
+            egui::ComboBox::from_id_salt("clip_audio_channels")
+                .selected_text(channels.label())
+                .show_ui(ui, |ui| {
+                    for mode in project::AudioChannels::ALL {
+                        ui.selectable_value(&mut channels, mode, mode.label());
+                    }
+                });
+        });
+        ui.add(
+            egui::Slider::new(&mut balance, -100..=100)
+                .text("Balance")
+                .suffix("%"),
+        );
+        if fades != original_fades {
             self.update_selected_clip(LiveControl::Gain, |clip| {
-                clip.gain = gain;
                 clip.set_audio_fade(fades[0], fades[1]);
             });
+        }
+        if pitch != original_pitch {
+            self.update_selected_clip(LiveControl::Pitch, |clip| clip.pitch_semitones = pitch);
+        }
+        if (channels, balance) != original_channels {
+            self.update_selected_clip(LiveControl::AudioChannels, |clip| {
+                clip.audio_channels = channels;
+                clip.audio_balance = balance;
+            });
+        }
+        if ui
+            .button("Normalize loudness")
+            .on_hover_text("Targets −16 LUFS within the clip gain and peak limits.")
+            .clicked()
+        {
+            self.normalize_selected_audio(ui.ctx());
+        }
+        if ui
+            .button("Detect beats")
+            .on_hover_text("Add timeline markers at beats in the selected clip")
+            .clicked()
+        {
+            self.detect_selected_beats(ui.ctx());
         }
         if ui.button("Browse audio effects").clicked() {
             self.library = LibraryTab::Audio;
@@ -2059,6 +3473,56 @@ impl Editor {
             self.audio_presets = true;
             self.inspector_tab = InspectorTab::Effects;
         }
+        self.scalar_keyframes(ui, &id, project::AnimatedProperty::AudioGain);
+    }
+
+    fn normalize_selected_audio(&mut self, ctx: &egui::Context) {
+        let Some((row, index)) = self
+            .selection
+            .clip
+            .as_deref()
+            .and_then(|id| self.project.location(id))
+        else {
+            return;
+        };
+        let clip = self.project.tracks[row].clips[index].clone();
+        let Some(asset) = self.project.asset(&clip.asset_id).cloned() else {
+            return;
+        };
+        self.start_job(
+            ctx,
+            "Measuring clip loudness",
+            JobStyle::Cancellable,
+            move |cancel, _| {
+                let (gain, lufs) = media::normalize_clip_loudness(&clip, &asset, cancel)?;
+                Ok(Completed::Loudness(clip, gain, lufs))
+            },
+        );
+    }
+
+    fn detect_selected_beats(&mut self, ctx: &egui::Context) {
+        let Some((row, index)) = self
+            .selection
+            .clip
+            .as_deref()
+            .and_then(|id| self.project.location(id))
+        else {
+            return;
+        };
+        let clip = self.project.tracks[row].clips[index].clone();
+        let Some(asset) = self.project.asset(&clip.asset_id).cloned() else {
+            return;
+        };
+        self.stop_player();
+        self.start_job(
+            ctx,
+            "Finding beats",
+            JobStyle::Cancellable,
+            move |cancel, _| {
+                let positions = media::detect_clip_beats(&clip, &asset, cancel)?;
+                Ok(Completed::Beats(clip, positions))
+            },
+        );
     }
 
     fn fade_controls(ui: &mut egui::Ui, id: &str, clip_length: u32, fades: &mut [u32; 2]) {
@@ -2084,6 +3548,7 @@ impl Editor {
     }
 
     fn clip_inspector(&mut self, ui: &mut egui::Ui) {
+        self.speed_controls(ui);
         if let Some((edit, gain)) = &mut self.edit {
             let old_transform = self.transform;
             let clip = &self.project.tracks[edit.row]
@@ -2092,7 +3557,14 @@ impl Editor {
                 .find(|clip| clip.id == edit.id)
                 .unwrap();
             let has_source = clip.source > 0;
+            let original_framing = clip.framing;
+            let mut framing = original_framing;
+            let original_blend = clip.blend_mode;
+            let mut blend_mode = original_blend;
             let animated_position = !clip.position_animation.is_empty();
+            let animated_opacity = !clip.opacity_animation.is_empty();
+            let animated_rotation = !clip.rotation_animation.is_empty();
+            let animated_scale = !clip.scale_animation.is_empty();
             if let Some(asset) = self.project.asset(&clip.asset_id) {
                 let title = if clip.slot {
                     format!("Slot · {}", asset.label)
@@ -2109,12 +3581,15 @@ impl Editor {
                     .spacing(vec2(10.0, 6.0))
                     .show(ui, |ui| {
                         for (label, amount, min, max) in [
-                            ("Scale", &mut transform.scale, 0.1, 3.0),
+                            ("Scale", &mut transform.scale, 0.1, project::MAX_CLIP_SCALE),
                             ("Position X", &mut transform.x, -1.5, 1.5),
                             ("Position Y", &mut transform.y, -1.5, 1.5),
                             ("Opacity", &mut transform.opacity, 0.0, 1.0),
                         ] {
-                            if animated_position && label.starts_with("Position") {
+                            if (animated_position && label.starts_with("Position"))
+                                || (animated_opacity && label == "Opacity")
+                                || (animated_scale && label == "Scale")
+                            {
                                 continue;
                             }
                             ui.label(label);
@@ -2132,19 +3607,58 @@ impl Editor {
                             }
                             ui.end_row();
                         }
-                        ui.label("Rotation");
-                        ui.add(
-                            egui::DragValue::new(&mut transform.rotation)
-                                .range(-180.0..=180.0)
-                                .suffix("°"),
-                        );
-                        ui.end_row();
+                        if !animated_rotation {
+                            ui.label("Rotation");
+                            ui.add(
+                                egui::DragValue::new(&mut transform.rotation)
+                                    .range(-180.0..=180.0)
+                                    .suffix("°"),
+                            );
+                            ui.end_row();
+                        }
                     });
                 if ui.button("Animations and keyframes…").clicked() {
                     self.inspector_tab = InspectorTab::Motion;
                 }
                 if ui.button("Reset transform").clicked() {
                     self.transform = Transform::default();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Blend");
+                    egui::ComboBox::from_id_salt("clip_blend_mode")
+                        .selected_text(blend_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in project::BlendMode::ALL {
+                                ui.selectable_value(&mut blend_mode, mode, mode.label());
+                            }
+                        });
+                });
+                if self.title.is_none() {
+                    ui.collapsing("Crop and mirror", |ui| {
+                        ui.checkbox(&mut framing.flip_horizontal, "Mirror horizontally");
+                        ui.checkbox(&mut framing.flip_vertical, "Flip vertically");
+                        egui::Grid::new("crop_edges").show(ui, |ui| {
+                            let [left, right, top, bottom] =
+                                [framing.left, framing.right, framing.top, framing.bottom];
+                            for (label, value, opposite) in [
+                                ("Left", &mut framing.left, right),
+                                ("Right", &mut framing.right, left),
+                                ("Top", &mut framing.top, bottom),
+                                ("Bottom", &mut framing.bottom, top),
+                            ] {
+                                ui.label(label);
+                                ui.add(
+                                    egui::DragValue::new(value)
+                                        .range(0..=95 - opposite)
+                                        .suffix("%"),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                        if ui.button("Reset crop and mirror").clicked() {
+                            framing = project::Framing::default();
+                        }
+                    });
                 }
             }
             ui.separator();
@@ -2173,6 +3687,12 @@ impl Editor {
                     clip.transform = transform
                 });
             }
+            if framing != original_framing {
+                self.update_selected_clip(LiveControl::Framing, |clip| clip.framing = framing);
+            }
+            if blend_mode != original_blend {
+                self.update_selected_clip(LiveControl::Blend, |clip| clip.blend_mode = blend_mode);
+            }
             if self.title.is_none() {
                 ui.separator();
                 if ui.button("Replace media…").clicked() {
@@ -2189,6 +3709,49 @@ impl Editor {
             ui.add_space(8.0);
             ui.separator();
             self.canvas_options(ui);
+        }
+    }
+
+    fn speed_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.selection.clip.clone() else {
+            return;
+        };
+        let Some((row, index)) = self.project.location(&id) else {
+            return;
+        };
+        let clip = &self.project.tracks[row].clips[index];
+        if clip.freeze
+            || clip.slot
+            || !self
+                .project
+                .asset(&clip.asset_id)
+                .is_some_and(|asset| matches!(asset.kind, AssetKind::Video | AssetKind::Audio))
+        {
+            return;
+        }
+        let original = clip.speed_percent;
+        let mut speed = original;
+        ui.horizontal(|ui| {
+            ui.label("Playback speed");
+            egui::ComboBox::from_id_salt("clip_speed")
+                .selected_text(format!("{:.2}×", f32::from(speed) / 100.0))
+                .show_ui(ui, |ui| {
+                    for percent in [25, 50, 75, 100, 125, 150, 200, 300, 400] {
+                        ui.selectable_value(
+                            &mut speed,
+                            percent,
+                            format!("{:.2}×", f32::from(percent) / 100.0),
+                        );
+                    }
+                });
+        });
+        if speed != original {
+            match self.commit(|project| project.set_clip_speed(&id, speed)) {
+                Ok(()) => {
+                    self.status = format!("Playback speed set to {:.2}×.", f32::from(speed) / 100.0)
+                }
+                Err(error) => self.error("Change playback speed", error),
+            }
         }
     }
 
@@ -2336,6 +3899,30 @@ impl Editor {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
+            if self.show_tracking_patch
+                && self.inspector_tab == InspectorTab::Motion
+                && self
+                    .edit
+                    .as_ref()
+                    .is_some_and(|(clip, _)| clip.start == self.frame)
+            {
+                let size = image_rect.width().min(image_rect.height())
+                    * f32::from(self.tracking_seed.size)
+                    / 100.0;
+                let half = size / 2.0;
+                let x = (image_rect.left()
+                    + image_rect.width() * f32::from(self.tracking_seed.x) / 100.0)
+                    .clamp(image_rect.left() + half, image_rect.right() - half);
+                let y = (image_rect.top()
+                    + image_rect.height() * f32::from(self.tracking_seed.y) / 100.0)
+                    .clamp(image_rect.top() + half, image_rect.bottom() - half);
+                painter.with_clip_rect(area).rect_stroke(
+                    egui::Rect::from_center_size(egui::pos2(x, y), vec2(size, size)),
+                    2.0,
+                    Stroke::new(2.0, ACCENT),
+                    StrokeKind::Inside,
+                );
+            }
         } else {
             let label = if self.project.duration() == 0 {
                 "The timeline is empty"
@@ -2404,6 +3991,88 @@ impl Editor {
         });
     }
 
+    fn marker_menu(&mut self, ui: &mut egui::Ui) {
+        let frame = self.frame;
+        let existing = self
+            .project
+            .markers
+            .iter()
+            .find(|marker| marker.frame == frame);
+        let mut label = existing.map_or_else(String::new, |marker| marker.label.clone());
+        let input_id = ui.make_persistent_id(("marker_name", frame));
+        let saved = ui.data(|data| data.get_temp::<String>(input_id));
+        if let Some(saved) = saved {
+            label = saved;
+        }
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut label)
+                    .char_limit(64)
+                    .hint_text("Marker name"),
+            )
+            .changed()
+        {
+            ui.data_mut(|data| data.insert_temp(input_id, label.clone()));
+        }
+        let mut remove = None;
+        let mut seek = None;
+        if ui
+            .button(if existing.is_some() {
+                "Update marker"
+            } else {
+                "Add marker at playhead"
+            })
+            .clicked()
+        {
+            let fallback = format!("Marker {}", self.project.markers.len() + 1);
+            let name = if label.trim().is_empty() {
+                &fallback
+            } else {
+                &label
+            };
+            let result = self.commit(|project| project.set_marker(frame, name));
+            if let Err(error) = result {
+                self.error("Set marker", error);
+            } else {
+                ui.data_mut(|data| data.remove::<String>(input_id));
+            }
+            ui.close();
+        }
+        if !self.project.markers.is_empty() {
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for marker in &self.project.markers {
+                        ui.horizontal(|ui| {
+                            let title = format!("{}  {}", timestamp(marker.frame), marker.label);
+                            if ui
+                                .add_enabled(
+                                    marker.frame <= self.project.duration(),
+                                    egui::Button::new(title).truncate(),
+                                )
+                                .clicked()
+                            {
+                                seek = Some(marker.frame);
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(marker.frame);
+                            }
+                        });
+                    }
+                });
+        }
+        if let Some(frame) = remove {
+            let _ = self.commit(|project| {
+                project.remove_marker(frame);
+                Ok(())
+            });
+        } else if let Some(frame) = seek {
+            self.seek(frame);
+            ui.close();
+        }
+    }
+
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Timeline");
@@ -2432,6 +4101,23 @@ impl Editor {
             {
                 self.delete();
             }
+            if ui
+                .button("Voiceover…")
+                .on_hover_text("Record a microphone at the playhead")
+                .clicked()
+            {
+                self.stop_player();
+                match crate::voiceover::input_names() {
+                    Ok(devices) => {
+                        self.voiceover_setup = Some(VoiceoverSetup {
+                            devices,
+                            monitor: true,
+                            device: None,
+                        });
+                    }
+                    Err(error) => self.error("Open microphone settings", error),
+                }
+            }
             ui.menu_button("Tracks", |ui| {
                 if ui.button("Add video track").clicked() {
                     ui.close();
@@ -2440,6 +4126,26 @@ impl Editor {
                 if ui.button("Add audio track").clicked() {
                     ui.close();
                     self.add_track(TrackKind::Audio);
+                }
+                if ui.button("Close gaps on selected track").clicked() {
+                    ui.close();
+                    let row = self.selection.row;
+                    match self.commit(|project| project.close_track_gaps(row)) {
+                        Ok(frames) => {
+                            self.status = format!("Closed {} of gaps.", timestamp(frames))
+                        }
+                        Err(error) => self.error("Close track gaps", error),
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        self.multi_selection.len() >= 2,
+                        egui::Button::new("Group selected clips"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.group_selection();
                 }
                 let row = self.selection.row;
                 let label = if self.project.tracks[row].muted {
@@ -2468,6 +4174,12 @@ impl Editor {
                     });
                 }
             });
+            egui::containers::menu::MenuButton::new("Markers")
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                )
+                .ui(ui, |ui| self.marker_menu(ui));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.zoom, 12.0..=220.0)
@@ -2475,13 +4187,38 @@ impl Editor {
                         .text("Zoom"),
                 );
                 ui.checkbox(&mut self.snap, "Snap");
+                let mut magnet = self.main_track_magnet;
+                if ui
+                    .checkbox(&mut magnet, "Main track magnet")
+                    .on_hover_text("Keep clips on the first video track contiguous")
+                    .changed()
+                {
+                    if magnet {
+                        let row = self
+                            .project
+                            .tracks
+                            .iter()
+                            .position(|track| track.kind == TrackKind::Video);
+                        let result = row.map_or(Ok(0), |row| {
+                            self.commit(|project| project.close_track_gaps(row))
+                        });
+                        match result {
+                            Ok(_) => self.main_track_magnet = true,
+                            Err(error) => self.error("Enable main track magnet", error),
+                        }
+                    } else {
+                        self.main_track_magnet = false;
+                    }
+                }
             });
         });
         let events = self.timeline.show(
             ui,
             View {
+                can_paste_settings: self.copied_clip_settings.is_some(),
                 project: &self.project,
                 selection: &self.selection,
+                multi_selection: &self.multi_selection,
                 frame: self.frame,
                 zoom: self.zoom,
                 snap: self.snap,
@@ -2493,6 +4230,9 @@ impl Editor {
         }
         if let Some(selection) = events.select {
             self.select(selection);
+        }
+        if let Some(selection) = events.toggle_selection {
+            self.toggle_clip_selection(selection);
         }
         if let Some(frame) = events.seek {
             self.seek(frame);
@@ -2518,13 +4258,26 @@ impl Editor {
 impl eframe::App for Editor {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_work(ctx);
+        self.collect_voiceover(ctx);
         self.thumbnails.collect(ctx);
+        match self.autosave.tick(ctx, &self.project) {
+            Ok(true) => self.draft_saved = true,
+            Ok(false) => {}
+            Err(error) => {
+                self.draft_saved = false;
+                self.status = format!("Autosave failed. {error}");
+            }
+        }
         if ctx.input(|input| input.viewport().close_requested()) {
-            if let Some(job) = &self.job {
+            if self.voiceover.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if let Some(job) = &self.job {
                 job.cancel.store(true, Ordering::Relaxed);
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             } else if !self.may_discard() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                self.autosave.clear();
             }
         }
     }
@@ -2535,6 +4288,9 @@ impl eframe::App for Editor {
             && self.report.is_none()
             && self.export_dialog.is_none()
             && self.font_browser.is_none()
+            && self.voiceover.is_none()
+            && self.voiceover_setup.is_none()
+            && self.recovery_candidates.is_none()
         {
             let save =
                 ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
@@ -2556,6 +4312,18 @@ impl eframe::App for Editor {
                 }
                 if ctx.input(|input| input.key_pressed(egui::Key::Delete)) {
                     self.delete();
+                }
+                if ctx.input_mut(|input| {
+                    input.consume_key(
+                        egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+                        egui::Key::G,
+                    )
+                }) {
+                    self.clip_action(&ctx, ClipAction::Ungroup);
+                } else if ctx
+                    .input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::G))
+                {
+                    self.group_selection();
                 }
                 if ctx.input(|input| input.key_pressed(egui::Key::F)) {
                     self.toggle_focus_view();
@@ -2579,6 +4347,9 @@ impl eframe::App for Editor {
             } else {
                 self.import_media(&ctx, dropped);
             }
+        }
+        if self.voiceover.is_some() {
+            ui.disable();
         }
         ui.painter().rect_filled(ui.max_rect(), 0, BACK);
         let room = ui.available_size();
@@ -2604,6 +4375,9 @@ impl eframe::App for Editor {
                             .color(MUTED)
                             .monospace(),
                         );
+                        if self.draft_saved {
+                            ui.label(RichText::new("Draft backed up").color(MUTED).small());
+                        }
                     });
                 });
             });
@@ -2647,6 +4421,8 @@ impl eframe::App for Editor {
         egui::CentralPanel::default()
             .frame(theme::panel())
             .show(ui, |ui| self.monitor(ui));
+        self.voiceover_dialog(&ctx);
+        self.recovery_dialog(&ctx);
         if let Some(browser) = &mut self.font_browser
             && let Some(choice) = browser.show(&ctx)
         {
@@ -2661,8 +4437,8 @@ impl eframe::App for Editor {
             && let Some(decision) = dialog.show(&ctx, &self.project, self.texture.as_ref())
         {
             self.export_dialog = None;
-            if let Decision::Render(path, settings) = decision {
-                self.export(&ctx, path, settings);
+            if let Decision::Render(path, settings, range, details) = decision {
+                self.export(&ctx, path, settings, range, details);
             }
         }
         if let Some(job) = &self.job {
@@ -2873,7 +4649,21 @@ fn media_dialog() -> FileDialog {
         .add_filter("Video", VIDEO_FILES)
         .add_filter("Audio", AUDIO_FILES)
         .add_filter("Images", IMAGE_FILES)
+        .add_filter("Animated GIF", &["gif"])
         .add_filter("All files", &["*"])
+}
+
+fn choose_subject_model() -> Option<PathBuf> {
+    FileDialog::new()
+        .set_title("Choose a local U²-Net ONNX model")
+        .add_filter("ONNX model", &["onnx"])
+        .pick_file()
+}
+
+fn subject_python() -> PathBuf {
+    std::env::var_os("CUTAD_CUTOUT_PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
 }
 
 fn with_extension(path: PathBuf, extension: &str) -> PathBuf {

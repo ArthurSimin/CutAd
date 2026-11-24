@@ -5,6 +5,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      local_models:
+        description: Run the local background removal and reframe tests
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,6 +57,51 @@ jobs:
       - run: ffmpeg -version
       - run: cargo +stable fmt --check
       - run: cargo +stable test --locked --release -- --test-threads=1
+      - uses: actions/setup-python@v5
+        if: inputs.local_models
+        with:
+          python-version: '3.12'
+      - name: Install local inference dependencies
+        if: inputs.local_models
+        run: python -m pip install "rembg[cpu]==2.0.69"
+      - name: Fetch local model test fixtures
+        if: inputs.local_models
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import sys
+          import subprocess
+
+          fixtures = {
+              "CUTAD_TEST_ONNX": (
+                  "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
+                  "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8",
+              ),
+              "CUTAD_TEST_CUTOUT_PHOTO": (
+                  "https://raw.githubusercontent.com/scikit-image/scikit-image/v0.25.2/skimage/data/astronaut.png",
+                  "88431cd9653ccd539741b555fb0a46b61558b301d4110412b5bc28b5e3ea6cb5",
+              ),
+          }
+          work = pathlib.Path(os.environ["RUNNER_TEMP"]) / "cutad-model-tests"
+          work.mkdir(exist_ok=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
+              environment.write(f"CUTAD_CUTOUT_PYTHON={sys.executable}\n")
+              for variable, (url, checksum) in fixtures.items():
+                  path = work / url.rsplit("/", 1)[-1]
+                  subprocess.run(
+                      ["curl", "-fsSL", "--retry", "3", "--max-time", "60", url, "-o", str(path)],
+                      check=True,
+                  )
+                  if hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
+                      raise RuntimeError(f"Checksum mismatch for {variable}")
+                  environment.write(f"{variable}={path}\n")
+          PY
+      - name: Test offline background removal and reframing
+        if: inputs.local_models
+        run: cargo +stable test --locked --release --test cutout -- --include-ignored --test-threads=1
       - run: cargo +stable build --locked --release
       - name: Package tagged build
         if: startsWith(github.ref, 'refs/tags/v')
@@ -92,4 +142,6 @@ jobs:
           sha256sum CutAd-*.zip CutAd-*.tar.gz > SHA256SUMS
           notes=()
           if [[ -f "../docs/releases/$TAG.md" ]]; then notes=(--notes-file "../docs/releases/$TAG.md"); fi
-          gh release create "$TAG" --verify-tag --title "CutAd ${TAG#v}" --generate-notes "${notes[@]}" CutAd-*.zip CutAd-*.tar.gz SHA256SUMS
+          release_flags=()
+          if [[ "$TAG" == *-* ]]; then release_flags=(--prerelease --latest=false); fi
+          gh release create "$TAG" --verify-tag "${release_flags[@]}" --title "CutAd ${TAG#v}" --generate-notes "${notes[@]}" CutAd-*.zip CutAd-*.tar.gz SHA256SUMS

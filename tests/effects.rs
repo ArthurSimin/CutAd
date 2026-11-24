@@ -102,6 +102,67 @@ fn every_preset_runs_through_the_shared_renderer() -> Result<()> {
 }
 
 #[test]
+fn motion_blur_keeps_frame_history_in_preview_and_range_exports() -> Result<()> {
+    use cutad::media::{
+        Output, PreviewQuality, render_preview_frame_with, render_timeline_section,
+    };
+
+    let folder = tempdir()?;
+    let source = folder.path().join("motion.mkv");
+    let output = Command::new(executable("ffmpeg")?)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:s=64x64:r=30:d=3,geq=lum='if(mod(N,4),225,16)':cb=128:cr=128",
+            "-c:v",
+            "ffv1",
+            "-threads:v",
+            "1",
+        ])
+        .arg(&source)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let asset = probe(&source)?;
+    let clip = Clip::new(asset.id.clone(), 0, 0, 85);
+    let mut project = Project {
+        width: 64,
+        height: 64,
+        assets: vec![asset],
+        ..Project::default()
+    };
+    project.tracks[0].clips.push(clip);
+    let cancel = AtomicBool::new(false);
+    let pixel = (32 * 64 + 32) * 3;
+    let clear = render_preview_frame_with(&project, 68, PreviewQuality::Full, &cancel)?;
+    assert!(clear[pixel] < 12);
+    project.tracks[0].clips[0].effects.push(Effect {
+        preset: Preset::MotionBlur,
+        amount: 100,
+        enabled: true,
+    });
+    let softened = render_preview_frame_with(&project, 68, PreviewQuality::Full, &cancel)?;
+    assert!(softened[pixel] > 120);
+    let delivery = folder.path().join("motion-blur.mkv");
+    render_timeline_section(
+        &project,
+        &delivery,
+        Output::new(Format::Mkv),
+        68..74,
+        &cancel,
+        |_| {},
+    )?;
+    assert_eq!(monitor_frame(&delivery, 0, [64, 64])?, softened);
+    Ok(())
+}
+
+#[test]
 fn transitions_work_at_a_cut_without_lengthening_it() -> Result<()> {
     use cutad::effects::{Transition, TransitionKind};
 

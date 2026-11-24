@@ -128,9 +128,11 @@ fn tools(writable: bool) -> Vec<Value> {
                 json!({"text":{"type":"string","maxLength":1024}, "frame":frame}), &["text","frame"]),
             tool("split_clip", "Split one existing clip at a timeline frame.", false,
                 json!({"clip_id":id, "frame":frame}), &["clip_id","frame"]),
-            tool("set_clip_gain", "Set the clip's audio gain multiplier.", false,
+            tool("set_clip_gain", "Set a constant audio gain multiplier and clear the clip's gain keyframes.", false,
                 json!({"clip_id":id, "gain":{"type":"number","minimum":0,"maximum":4}}), &["clip_id","gain"]),
-            tool("export", "Render a new MP4, WebM, MKV, WAV, or SRT next to the project. Existing files are protected.", false,
+            tool("set_gain_keyframe", "Set an audio gain multiplier at a timeline frame inside the clip.", false,
+                json!({"clip_id":id, "frame":frame, "gain":{"type":"number","minimum":0,"maximum":4}}), &["clip_id","frame","gain"]),
+            tool("export", "Render a new MP4, WebM, MKV, GIF, WAV, FLAC, MP3, or SRT next to the project. Existing files are protected.", false,
                 json!({"filename":{"type":"string"}}), &["filename"]),
         ]);
     }
@@ -176,7 +178,7 @@ fn invoke(path: &Path, writable: bool, name: &str, args: &Value) -> Result<Value
             json!({"clip_id":project.add_title(TitleStyle::Headline, title, frame()?)?})
         }
         "split_clip" => json!({"clip_id":project.split(field("clip_id")?, frame()?)?}),
-        "set_clip_gain" => {
+        "set_clip_gain" | "set_gain_keyframe" => {
             let (row, index) = project
                 .location(field("clip_id")?)
                 .context("Clip not found.")?;
@@ -184,8 +186,30 @@ fn invoke(path: &Path, writable: bool, name: &str, args: &Value) -> Result<Value
                 .as_f64()
                 .filter(|x| (0.0..=4.0).contains(x))
                 .context("Gain must be between 0 and 4.")?;
-            project.tracks[row].clips[index].gain = gain as f32;
-            json!({"gain": gain})
+            if name == "set_gain_keyframe" {
+                let clip = &project.tracks[row].clips[index];
+                ensure!(
+                    !clip.freeze
+                        && !clip.slot
+                        && project
+                            .asset(&clip.asset_id)
+                            .is_some_and(|asset| asset.audio),
+                    "Choose a clip with audio."
+                );
+            }
+            let clip = &mut project.tracks[row].clips[index];
+            if name == "set_gain_keyframe" {
+                let timeline = frame()?;
+                let local = timeline
+                    .checked_sub(clip.start)
+                    .context("Choose a frame inside the clip.")?;
+                clip.set_scalar_keyframe(project::AnimatedProperty::AudioGain, local, gain as f32)?;
+                json!({"gain": gain, "frame": timeline})
+            } else {
+                clip.gain = gain as f32;
+                clip.gain_animation = Default::default();
+                json!({"gain": gain})
+            }
         }
         "export" => return export(path, &project, field("filename")?),
         _ => bail!("Unknown CutAd tool."),
@@ -222,11 +246,18 @@ fn export(project_file: &Path, project: &Project, filename: &str) -> Result<Valu
         "srt" => {
             cutad::subtitles::write(project, &scratch)?;
         }
-        "wav" => media::render_audio_master(project, &scratch, &cancel, |_| {})?,
-        "mp4" | "webm" | "mkv" => {
+        "wav" | "flac" | "mp3" => media::export_audio(
+            project,
+            &scratch,
+            media::AudioFormat::from_path(&scratch)?,
+            &cancel,
+            |_| {},
+        )?,
+        "mp4" | "webm" | "mkv" | "gif" => {
             let format = match extension {
                 "webm" => media::Format::Webm,
                 "mkv" => media::Format::Mkv,
+                "gif" => media::Format::Gif,
                 _ => media::Format::Mp4,
             };
             media::render_with(
@@ -237,7 +268,7 @@ fn export(project_file: &Path, project: &Project, filename: &str) -> Result<Valu
                 |_| {},
             )?;
         }
-        _ => bail!("Choose .mp4, .webm, .mkv, .wav, or .srt."),
+        _ => bail!("Choose .mp4, .webm, .mkv, .gif, .wav, .flac, .mp3, or .srt."),
     }
     scratch
         .persist_noclobber(&dest)

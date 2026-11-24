@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cutad::{
     project::{Asset, Clip, Project, TitleStyle, Track, TrackKind, load, save},
-    subtitles::{add_tracks, parse, read, write},
+    subtitles::{add_tracks, caption_clips, parse, read, write, write_transcript},
 };
 
 #[test]
@@ -48,9 +48,22 @@ fn exports_unmuted_caption_clips_in_timeline_order_and_retains_frame_boundaries(
     project.assets.extend([title, first, second, hidden]);
     project.tracks.extend([captions, overlays, muted]);
 
+    let first_match = caption_clips(&project, "  OLÁ  ");
+    assert_eq!(first_match.len(), 1);
+    assert_eq!(first_match[0].0.start, 1);
+    assert_eq!(first_match[0].1, "Olá\r\n\r\nworld");
+    assert!(caption_clips(&project, "Leave me out").is_empty());
+    assert!(caption_clips(&project, "Hidden track").is_empty());
+
     let folder = tempfile::tempdir()?;
     let path = folder.path().join("captions.srt");
     assert_eq!(write(&project, &path)?, 2);
+    let transcript = folder.path().join("transcript.txt");
+    assert_eq!(write_transcript(&project, &transcript)?, 2);
+    assert_eq!(
+        std::fs::read_to_string(transcript)?,
+        "Olá world\nOne more line\n"
+    );
     assert_eq!(
         std::fs::read_to_string(&path)?,
         "1\n00:00:00,033 --> 00:00:00,133\nOlá\nworld\n\n2\n00:00:00,100 --> 00:00:00,166\nOne more line\n\n"

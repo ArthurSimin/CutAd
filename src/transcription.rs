@@ -28,7 +28,7 @@ pub fn has_audible_clip(project: &Project) -> bool {
         .filter(|track| !track.muted)
         .flat_map(|track| &track.clips)
         .any(|clip| {
-            clip.gain > 0.0
+            clip.has_audible_gain()
                 && !clip.freeze
                 && !clip.slot
                 && project
@@ -38,6 +38,23 @@ pub fn has_audible_clip(project: &Project) -> bool {
 }
 
 pub fn generate(project: &Project, model: &Path, cancel: &AtomicBool) -> Result<Vec<Cue>> {
+    generate_cues(project, model, false, cancel)
+}
+
+pub fn translate_to_english(
+    project: &Project,
+    model: &Path,
+    cancel: &AtomicBool,
+) -> Result<Vec<Cue>> {
+    generate_cues(project, model, true, cancel)
+}
+
+fn generate_cues(
+    project: &Project,
+    model: &Path,
+    translate: bool,
+    cancel: &AtomicBool,
+) -> Result<Vec<Cue>> {
     check_cancel(cancel)?;
     let model = std::path::absolute(model)?;
     ensure!(
@@ -70,6 +87,9 @@ pub fn generate(project: &Project, model: &Path, cancel: &AtomicBool) -> Result<
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     let mut log = tempfile::tempfile_in(folder.path())?;
+    if translate {
+        command.args(["--translate", "--output-json"]);
+    }
     let mut child = command
         .current_dir(folder.path())
         .arg("-m")
@@ -92,6 +112,16 @@ pub fn generate(project: &Project, model: &Path, cancel: &AtomicBool) -> Result<
         );
     }
     check_cancel(cancel)?;
+    if translate {
+        let report: serde_json::Value = serde_json::from_reader(
+            File::open(folder.path().join("captions.json"))
+                .context("Whisper did not report its translation settings.")?,
+        )?;
+        ensure!(
+            report["params"]["translate"].as_bool() == Some(true),
+            "Choose a multilingual Whisper model for English translation."
+        );
+    }
     let path = folder.path().join("captions.srt");
     let mut cues = subtitles::read(&path).with_context(|| {
         if path.is_file() {
