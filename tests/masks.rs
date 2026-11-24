@@ -3,7 +3,7 @@ use cutad::media::{
     Format, PreviewQuality, executable, export_frame_png, monitor_frame, probe, render,
     render_preview_frame, render_preview_frame_with,
 };
-use cutad::project::{Clip, Project, Track, TrackKind, load, save};
+use cutad::project::{Clip, MaskStroke, Project, Track, TrackKind, load, save};
 use serde_json::{Value, json};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -18,6 +18,70 @@ fn set_mask(clip: &mut Clip, mask: Value) -> Result<()> {
 fn sample(pixels: &[u8], x: usize, y: usize) -> [u8; 3] {
     let start = (64 * y + x) * 3;
     pixels[start..start + 3].try_into().unwrap()
+}
+
+#[test]
+fn brush_strokes_restore_erased_pixels_and_export_with_the_clip_transform() -> Result<()> {
+    let folder = tempfile::tempdir()?;
+    let make_asset = |name, color: [u8; 3]| {
+        let path = folder.path().join(name);
+        let mut ppm = b"P6\n64 64\n255\n".to_vec();
+        ppm.extend(color.repeat(64 * 64));
+        std::fs::write(&path, ppm)?;
+        probe(&path)
+    };
+    let base = make_asset("blue.ppm", [0, 0, 255])?;
+    let foreground = make_asset("red.ppm", [255, 0, 0])?;
+    let background_clip = Clip::new(base.id.clone(), 0, 0, 8);
+    let mut clip = Clip::new(foreground.id.clone(), 0, 0, 8);
+    clip.transform.x = 0.125;
+    clip.mask_strokes = vec![
+        MaskStroke {
+            radius: 0.08,
+            points: vec![[0.25, 0.5], [0.75, 0.5]],
+            restore: false,
+        },
+        MaskStroke {
+            radius: 0.065,
+            points: vec![[0.5, 0.5]],
+            restore: true,
+        },
+    ];
+    let project = Project {
+        width: 64,
+        height: 64,
+        tracks: vec![
+            Track {
+                clips: vec![background_clip],
+                ..Track::new("Base", TrackKind::Video)
+            },
+            Track {
+                clips: vec![clip],
+                ..Track::new("Painted", TrackKind::Video)
+            },
+        ],
+        assets: vec![base, foreground],
+        ..Project::default()
+    };
+    let path = folder.path().join("painted.cutad");
+    save(&project, &path)?;
+    assert_eq!(project, load(&path)?);
+    let cancel = AtomicBool::new(false);
+    let preview = render_preview_frame(&project, 4, &cancel)?;
+    let export = folder.path().join("painted.mkv");
+    render(&project, &export, Format::Mkv, &cancel, |_| {})?;
+    let exported = monitor_frame(&export, 4, [64, 64])?;
+    for pixels in [&preview, &exported] {
+        for (x, y) in [(25, 32), (53, 32)] {
+            let pixel = sample(pixels, x, y);
+            assert!(pixel[2] > 220 && pixel[0] < 25, "erased {pixel:?}");
+        }
+        for (x, y) in [(40, 32), (40, 18)] {
+            let pixel = sample(pixels, x, y);
+            assert!(pixel[0] > 220 && pixel[2] < 25, "visible {pixel:?}");
+        }
+    }
+    Ok(())
 }
 
 #[test]

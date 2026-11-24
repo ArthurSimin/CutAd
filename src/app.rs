@@ -12,14 +12,15 @@ use cutad::capcut::{self, DraftImport};
 use cutad::effects::{Category, Effect, Preset, Transition, TransitionKind};
 use cutad::media::{self, Output, PreviewQuality};
 use cutad::project::{
-    self, Asset, AssetKind, ChromaKey, ClipMask, ColorAdjustment, FPS, MAX_FRAMES, MaskShape,
-    Project, TEMPLATES, Title, TitleStyle, Track, TrackKind, Transform, VideoGeometry, timestamp,
+    self, AnimatedProperty, Asset, AssetKind, ChromaKey, ClipMask, ColorAdjustment, FPS,
+    MAX_FRAMES, MaskShape, MaskStroke, Project, TEMPLATES, Title, TitleStyle, Track, TrackKind,
+    Transform, VideoGeometry, timestamp,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, vec2,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -41,6 +42,7 @@ enum Completed {
     Sticker(Asset, u32),
     Draft(DraftImport),
     Export(PathBuf),
+    PortableCopy(PathBuf),
     MatchCanvas(String, VideoGeometry),
     Subtitles(Vec<cutad::subtitles::Cue>),
     EnglishSubtitles(
@@ -49,13 +51,15 @@ enum Completed {
     ),
     CaptionExport(PathBuf, usize),
     Scenes(project::Clip, Vec<u32>),
-    Prepared(MediaPreparation, project::Clip, Asset, u8),
+    Prepared(MediaPreparation, Box<project::Clip>, Asset, u8),
     Tracked(project::Clip, project::PositionAnimation),
     Loudness(project::Clip, f32, f64),
     ColorSuggested(project::Clip, ColorAdjustment, bool),
     Reframed(project::Clip, [u32; 2], f32, project::PositionAnimation),
     Voiceover(Asset, u32, usize),
     Beats(project::Clip, Vec<u32>),
+    Proxy(Asset, project::PreviewProxy),
+    Synced(Vec<(project::Clip, Asset)>, Vec<i32>),
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +97,12 @@ struct CopiedClipSettings {
     clip: project::Clip,
     visual: bool,
     audio: bool,
+}
+
+struct CameraEdit {
+    angles: Vec<project::Clip>,
+    switches: BTreeMap<u32, usize>,
+    reference_audio: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,6 +164,7 @@ pub struct Editor {
     last_live_edit: Option<(LiveControl, Instant)>,
     selection: Selection,
     multi_selection: HashSet<String>,
+    camera_edit: Option<CameraEdit>,
     asset_id: Option<String>,
     edit: Option<(Placement, f32)>,
     copied_clip_settings: Option<CopiedClipSettings>,
@@ -171,6 +182,9 @@ pub struct Editor {
     show_transcript: bool,
     tracking_seed: cutad::tracking::Seed,
     show_tracking_patch: bool,
+    mask_brush: Option<bool>,
+    mask_radius: f32,
+    mask_stroke: Option<MaskStroke>,
     transcript_query: String,
     inspector_tab: InspectorTab,
     transform: Transform,
@@ -211,6 +225,7 @@ impl Editor {
             last_live_edit: None,
             selection: Selection { row: 0, clip: None },
             multi_selection: HashSet::new(),
+            camera_edit: None,
             asset_id: None,
             edit: None,
             copied_clip_settings: None,
@@ -228,6 +243,9 @@ impl Editor {
             show_transcript: false,
             tracking_seed: cutad::tracking::Seed::default(),
             show_tracking_patch: false,
+            mask_brush: None,
+            mask_radius: 0.05,
+            mask_stroke: None,
             transcript_query: String::new(),
             inspector_tab: InspectorTab::Video,
             transform: Transform::default(),
@@ -432,6 +450,7 @@ impl Editor {
         self.asset_id = None;
         self.history.clear();
         self.future.clear();
+        self.camera_edit = None;
         self.saved = if imported {
             Project::default()
         } else {
@@ -447,6 +466,8 @@ impl Editor {
         let new_clip = self.selection.clip != selection.clip;
         if new_clip {
             self.show_tracking_patch = false;
+            self.mask_brush = None;
+            self.mask_stroke = None;
         }
         self.selection = selection;
         self.last_live_edit = None;
@@ -508,6 +529,302 @@ impl Editor {
                 self.status = "Grouped clips. Drag any member to move the group.".into();
             }
             Err(error) => self.error("Group clips", error),
+        }
+    }
+
+    fn sync_selected_audio(&mut self, ctx: &egui::Context) -> Result<()> {
+        let anchor = self
+            .selection
+            .clip
+            .as_deref()
+            .context("Select a reference clip.")?;
+        let main_video = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.kind == TrackKind::Video);
+        let mut rows = HashSet::new();
+        let mut clips = Vec::new();
+        for id in std::iter::once(anchor).chain(
+            self.multi_selection
+                .iter()
+                .map(String::as_str)
+                .filter(|id| *id != anchor),
+        ) {
+            let (row, index) = self
+                .project
+                .location(id)
+                .context("The selected clip is missing.")?;
+            let clip = &self.project.tracks[row].clips[index];
+            let asset = self
+                .project
+                .asset(&clip.asset_id)
+                .context("The selected media is missing.")?;
+            anyhow::ensure!(
+                rows.insert(row)
+                    && asset.audio
+                    && !clip.freeze
+                    && !clip.slot
+                    && clip.speed_percent == project::NORMAL_SPEED,
+                "Select one normal-speed clip with audio on each track."
+            );
+            anyhow::ensure!(
+                id == anchor || !self.main_track_magnet || main_video != Some(row),
+                "Turn off Main track magnet to move a clip on the main track."
+            );
+            clips.push((clip.clone(), asset.clone()));
+        }
+        self.stop_player();
+        self.start_job(
+            ctx,
+            "Matching source audio",
+            JobStyle::Cancellable,
+            move |cancel, progress| {
+                let offsets = media::audio_sync_offsets(&clips, cancel, |value| {
+                    progress.store(value, Ordering::Relaxed);
+                })?;
+                Ok(Completed::Synced(clips, offsets))
+            },
+        );
+        Ok(())
+    }
+
+    fn sync_selected_markers(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.main_track_magnet,
+            "Turn off Main track magnet before aligning sync points."
+        );
+        let anchor = self
+            .selection
+            .clip
+            .as_deref()
+            .context("Select a reference clip.")?;
+        let ids = self.multi_selection.clone();
+        let anchor = anchor.to_owned();
+        let selection: Vec<_> = std::iter::once(anchor.as_str())
+            .chain(ids.iter().map(String::as_str).filter(|id| *id != anchor))
+            .collect();
+        self.commit(|project| project.align_clip_markers(&selection))?;
+        self.status = "Aligned clips to the reference sync point.".into();
+        Ok(())
+    }
+
+    fn start_camera_edit(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.main_track_magnet,
+            "Turn off Main track magnet before assembling camera angles."
+        );
+        let mut indexed: Vec<_> = self
+            .multi_selection
+            .iter()
+            .filter_map(|id| self.project.location(id))
+            .collect();
+        indexed.sort_unstable_by_key(|&(row, index)| {
+            let id = self.project.tracks[row].clips[index].id.as_str();
+            (self.selection.clip.as_deref() != Some(id), row, index)
+        });
+        let mut rows = HashSet::new();
+        let mut angles = Vec::new();
+        for (row, index) in indexed {
+            let track = &self.project.tracks[row];
+            let clip = &track.clips[index];
+            anyhow::ensure!(
+                rows.insert(row)
+                    && track.kind == TrackKind::Video
+                    && !clip.slot
+                    && !clip.freeze
+                    && clip.group_id.is_none()
+                    && self
+                        .project
+                        .asset(&clip.asset_id)
+                        .is_some_and(|asset| asset.kind == AssetKind::Video),
+                "Select one ungrouped video clip on each camera track."
+            );
+            angles.push(clip.clone());
+        }
+        anyhow::ensure!(
+            (2..=9).contains(&angles.len()),
+            "Select two to nine video angles."
+        );
+        let reference = &angles[0];
+        let reference_audio = self
+            .project
+            .asset(&reference.asset_id)
+            .is_some_and(|asset| asset.audio);
+        self.seek(reference.start);
+        self.camera_edit = Some(CameraEdit {
+            angles,
+            switches: BTreeMap::new(),
+            reference_audio,
+        });
+        Ok(())
+    }
+
+    fn camera_editor(&mut self, ctx: &egui::Context) {
+        let Some(edit) = &mut self.camera_edit else {
+            return;
+        };
+        let reference = &edit.angles[0];
+        let start = reference.start;
+        let end = reference.end();
+        let mut seek = None;
+        let mut apply = false;
+        let mut show = true;
+        egui::Window::new("Multicamera cut")
+            .open(&mut show)
+            .collapsible(false)
+            .default_width(490.0)
+            .show(ctx, |ui| {
+                let at = self.frame.clamp(start, end - 1);
+                let active = edit
+                    .switches
+                    .range(..=at)
+                    .next_back()
+                    .map_or(0, |(_, &index)| index);
+                let active = if at < edit.angles[active].end() {
+                    active
+                } else {
+                    0
+                };
+                ui.label("Choose an angle at the playhead to add a cut.");
+                let mut frame = at;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut frame, start..=end - 1)
+                            .show_value(false)
+                            .text("Playhead"),
+                    )
+                    .changed()
+                {
+                    seek = Some(frame);
+                }
+                ui.label(RichText::new(timestamp(at)).monospace().color(MUTED));
+                let available = ui.available_width();
+                let columns = if available >= 450.0 { 3 } else { 2 };
+                let tile_width = ((available - ui.spacing().item_spacing.x * (columns - 1) as f32)
+                    / columns as f32)
+                    .clamp(90.0, 200.0);
+                for first in (0..edit.angles.len()).step_by(columns) {
+                    ui.horizontal(|ui| {
+                        for index in first..(first + columns).min(edit.angles.len()) {
+                            let clip = &edit.angles[index];
+                            let asset = self.project.asset(&clip.asset_id);
+                            let label = asset.map_or("Missing media", |asset| asset.label.as_str());
+                            let available = (start..end).contains(&self.frame)
+                                && (clip.start..clip.end()).contains(&at)
+                                && asset.and_then(|asset| asset.path.as_ref()).is_some();
+                            ui.vertical(|ui| {
+                                let size = vec2(tile_width, tile_width * 9.0 / 16.0);
+                                let (rect, click) = ui.allocate_exact_size(size, Sense::click());
+                                ui.painter().rect_filled(rect, 5, BACK);
+                                if available && let Some(asset) = asset {
+                                    let tick = at - clip.start;
+                                    let step = FPS / 2;
+                                    let tick = if self.preview.is_playing() {
+                                        tick / step * step
+                                    } else {
+                                        tick
+                                    };
+                                    let source_frame = clip.source_frame_at(i64::from(tick));
+                                    if let Some(texture) =
+                                        self.thumbnails.image(ctx, asset, source_frame)
+                                    {
+                                        ui.painter().image(
+                                            texture.id(),
+                                            rect,
+                                            egui::Rect::from_min_max(
+                                                egui::Pos2::ZERO,
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            Color32::WHITE,
+                                        );
+                                    }
+                                    if click.clicked() {
+                                        edit.switches.insert(at, index);
+                                    }
+                                }
+                                if available && active == index {
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        5,
+                                        Stroke::new(2.0, ACCENT),
+                                        StrokeKind::Inside,
+                                    );
+                                }
+                                let text = if available {
+                                    label
+                                } else {
+                                    "Outside angle range"
+                                };
+                                ui.add_sized([tile_width, 18.0], egui::Label::new(text).truncate())
+                                    .on_hover_text(label);
+                            });
+                        }
+                    });
+                }
+                ui.separator();
+                if self
+                    .project
+                    .asset(&reference.asset_id)
+                    .is_some_and(|asset| asset.audio)
+                {
+                    ui.checkbox(&mut edit.reference_audio, "Use reference audio throughout");
+                }
+                let mut remove = None;
+                egui::ScrollArea::vertical()
+                    .max_height(115.0)
+                    .show(ui, |ui| {
+                        for (&time, &angle) in &edit.switches {
+                            ui.horizontal(|ui| {
+                                let name = self
+                                    .project
+                                    .asset(&edit.angles[angle].asset_id)
+                                    .map_or("Missing media", |asset| asset.label.as_str());
+                                if ui.button(format!("{}  {name}", timestamp(time))).clicked() {
+                                    seek = Some(time);
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove = Some(time);
+                                }
+                            });
+                        }
+                    });
+                if let Some(remove) = remove {
+                    edit.switches.remove(&remove);
+                }
+                apply = ui
+                    .add_enabled(
+                        !edit.switches.is_empty(),
+                        egui::Button::new("Apply angle cuts"),
+                    )
+                    .clicked();
+            });
+        if let Some(seek) = seek {
+            self.seek(seek);
+        }
+        if !show {
+            self.camera_edit = None;
+        } else if apply {
+            let edit = self.camera_edit.take().expect("camera edit is open");
+            let magnet = self.main_track_magnet;
+            let result = self.commit(|project| {
+                anyhow::ensure!(
+                    !magnet,
+                    "Turn off Main track magnet before assembling camera angles."
+                );
+                anyhow::ensure!(!edit.switches.is_empty(), "Choose at least one camera cut.");
+                project.assemble_camera_angles(&edit.angles, &edit.switches, edit.reference_audio)
+            });
+            match result {
+                Ok(id) => {
+                    self.seek(start);
+                    self.select_inserted(Ok(id), "Applied angle cuts");
+                }
+                Err(error) => {
+                    self.camera_edit = Some(edit);
+                    self.error("Apply angle cuts", error);
+                }
+            }
         }
     }
 
@@ -969,6 +1286,53 @@ impl Editor {
             ClipAction::Stabilize => {
                 self.prepare_selected_clip(ctx, &id, MediaPreparation::Stabilize)
             }
+            ClipAction::CreateProxy => self.create_proxy(ctx, &id),
+            ClipAction::UnlinkProxy => {
+                let result = self.commit(|project| {
+                    let (row, index) = project.location(&id).context("Select a video clip.")?;
+                    let asset_id = project.tracks[row].clips[index].asset_id.clone();
+                    let asset = project
+                        .assets
+                        .iter_mut()
+                        .find(|asset| asset.id == asset_id)
+                        .context("The video source is missing.")?;
+                    asset.proxy = None;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => self.status = "Unlinked the preview proxy.".into(),
+                    Err(error) => self.error("Unlink preview proxy", error),
+                }
+            }
+            ClipAction::SetSyncPoint | ClipAction::RemoveSyncPoint => {
+                let frame = self.frame;
+                let result = self.commit(|project| {
+                    let (row, index) = project.location(&id).context("Select a clip.")?;
+                    let clip = &mut project.tracks[row].clips[index];
+                    clip.sync_source = if matches!(action, ClipAction::RemoveSyncPoint) {
+                        None
+                    } else {
+                        anyhow::ensure!(
+                            (clip.start..clip.end()).contains(&frame) && !clip.freeze && !clip.slot,
+                            "Put the playhead inside the selected clip."
+                        );
+                        Some(u32::try_from(
+                            clip.source_units_at(i64::from(frame - clip.start)),
+                        )?)
+                    };
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => {
+                        self.status = if matches!(action, ClipAction::RemoveSyncPoint) {
+                            "Removed the sync point.".into()
+                        } else {
+                            format!("Set a clip sync point at {}.", timestamp(frame))
+                        };
+                    }
+                    Err(error) => self.error("Edit clip sync point", error),
+                }
+            }
             ClipAction::RemoveBackground => {
                 self.prepare_selected_clip(ctx, &id, MediaPreparation::Cutout)
             }
@@ -1142,6 +1506,36 @@ impl Editor {
         }
     }
 
+    fn create_proxy(&mut self, ctx: &egui::Context, id: &str) {
+        let Some((row, index)) = self.project.location(id) else {
+            return;
+        };
+        let clip = &self.project.tracks[row].clips[index];
+        let Some(asset) = self.project.asset(&clip.asset_id).cloned() else {
+            return;
+        };
+        let Some(destination) = self.choose_export_path(
+            "Save preview proxy",
+            "Preview proxy.mp4",
+            "MP4 video",
+            "mp4",
+        ) else {
+            return;
+        };
+        self.stop_player();
+        self.start_job(
+            ctx,
+            "Encoding preview proxy",
+            JobStyle::Export,
+            move |cancel, progress| {
+                let proxy = media::create_preview_proxy(&asset, &destination, cancel, |value| {
+                    progress.store(value, Ordering::Relaxed);
+                })?;
+                Ok(Completed::Proxy(asset, proxy))
+            },
+        );
+    }
+
     fn prepare_selected_clip(
         &mut self,
         ctx: &egui::Context,
@@ -1216,7 +1610,7 @@ impl Editor {
                     ).context("Background removal needs Python with rembg[cpu] installed. Set CUTAD_CUTOUT_PYTHON to that interpreter if needed.")?
                 }
             };
-            Ok(Completed::Prepared(preparation, clip, asset, subframe))
+            Ok(Completed::Prepared(preparation, Box::new(clip), asset, subframe))
         });
     }
 
@@ -1413,6 +1807,25 @@ impl Editor {
 
     fn complete(&mut self, result: Completed) {
         match result {
+            Completed::Proxy(original, proxy) => {
+                let result = self.commit(|project| {
+                    let asset = project
+                        .assets
+                        .iter_mut()
+                        .find(|asset| asset.id == original.id)
+                        .context("The video source is no longer in the project.")?;
+                    anyhow::ensure!(
+                        asset.path == original.path,
+                        "The video was relinked during encoding."
+                    );
+                    asset.proxy = Some(proxy);
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => self.status = "Linked a proxy for reduced-resolution preview.".into(),
+                    Err(error) => self.error("Link preview proxy", error),
+                }
+            }
             Completed::Media(assets, failures) => {
                 let first = assets.first().map(|asset| asset.id.clone());
                 let count = assets.len();
@@ -1465,6 +1878,32 @@ impl Editor {
                 }
             }
             Completed::Export(path) => self.status = format!("Exported {}.", filename(&path)),
+            Completed::PortableCopy(path) => {
+                self.status = format!("Saved portable project to {}", path.display());
+            }
+            Completed::Synced(originals, offsets) => {
+                let positions: Vec<_> = originals
+                    .iter()
+                    .zip(offsets)
+                    .map(|((clip, _), offset)| (clip.id.as_str(), offset))
+                    .collect();
+                match self.commit(|project| {
+                    for (clip, asset) in &originals {
+                        let (row, index) = project
+                            .location(&clip.id)
+                            .context("A synchronized clip is missing.")?;
+                        anyhow::ensure!(
+                            project.tracks[row].clips[index] == *clip
+                                && project.asset(&clip.asset_id) == Some(asset),
+                            "A clip changed during audio synchronization."
+                        );
+                    }
+                    project.align_clip_starts(&positions)
+                }) {
+                    Ok(()) => self.status = "Aligned clips to the reference audio.".into(),
+                    Err(error) => self.error("Align clips", error),
+                }
+            }
             Completed::CaptionExport(path, count) => {
                 self.status = format!("Exported {count} captions to {}.", filename(&path));
             }
@@ -1475,7 +1914,7 @@ impl Editor {
                         .location(&original.id)
                         .context("The selected clip is no longer available.")?;
                     anyhow::ensure!(
-                        project.tracks[row].clips[index] == original,
+                        project.tracks[row].clips[index] == *original,
                         "The clip changed while preparing its new media."
                     );
                     project.replace_media(&original.id, asset)?;
@@ -1786,6 +2225,31 @@ impl Editor {
                 if ui.button("Save as…").clicked() {
                     ui.close();
                     self.save(true);
+                }
+                if ui.button("Save portable copy…").clicked() {
+                    ui.close();
+                    if let Some(parent) = FileDialog::new()
+                        .set_title("Choose a folder for the portable copy")
+                        .pick_folder()
+                    {
+                        let project = self.project.clone();
+                        self.start_job(
+                            ui.ctx(),
+                            "Copying project and media",
+                            JobStyle::Export,
+                            move |cancel, progress| {
+                                let path = project::save_portable_copy(
+                                    &project,
+                                    &parent,
+                                    cancel,
+                                    |value| {
+                                        progress.store(value, Ordering::Relaxed);
+                                    },
+                                )?;
+                                Ok(Completed::PortableCopy(path))
+                            },
+                        );
+                    }
                 }
                 ui.separator();
                 if ui
@@ -2602,8 +3066,7 @@ impl Editor {
                             let width =
                                 ((ui.available_width() - spacing * ((columns - 1) as f32) - 3.0)
                                     / columns as f32)
-                                    .min(170.0)
-                                    .max(80.0);
+                                    .clamp(80.0, 170.0);
                             for row in assets.chunks(columns) {
                                 ui.horizontal(|ui| {
                                     for asset in row {
@@ -3332,9 +3795,58 @@ impl Editor {
             ui.separator();
         }
         let before = clip.mask;
+        let stroke_count = clip.mask_strokes.len();
+        ui.horizontal(|ui| {
+            for (restore, label) in [(false, "Erase brush"), (true, "Restore brush")] {
+                if ui
+                    .add_enabled(
+                        stroke_count < MaskStroke::MAX_STROKES,
+                        egui::Button::selectable(self.mask_brush == Some(restore), label),
+                    )
+                    .clicked()
+                {
+                    self.mask_stroke = None;
+                    self.mask_brush = (self.mask_brush != Some(restore)).then_some(restore);
+                }
+            }
+        });
+        if self.mask_brush.is_some() && stroke_count < MaskStroke::MAX_STROKES {
+            ui.horizontal(|ui| {
+                ui.label("Brush radius");
+                let mut percent = self.mask_radius * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut percent, 0.5..=25.0).suffix("%"))
+                    .changed()
+                {
+                    self.mask_radius = percent / 100.0;
+                }
+            });
+            ui.label(
+                RichText::new("Pause inside the selected clip, then paint in Preview.")
+                    .color(MUTED),
+            );
+        } else if stroke_count >= MaskStroke::MAX_STROKES {
+            ui.label("Brush stroke limit reached. Undo or clear the strokes to keep painting.");
+        }
+        if ui
+            .add_enabled(stroke_count > 0, egui::Button::new("Clear brush strokes"))
+            .clicked()
+        {
+            let id = self.selection.clip.clone().expect("selected clip");
+            let cleared = self.commit(|project| {
+                let (row, index) = project.location(&id).context("Select a clip.")?;
+                project.tracks[row].clips[index].mask_strokes.clear();
+                Ok(())
+            });
+            if let Err(error) = cleared {
+                self.error("Clear mask brush strokes", error);
+            }
+            self.mask_stroke = None;
+        }
+        ui.separator();
         let mut mask = before;
         let mut enabled = mask.is_some();
-        if ui.checkbox(&mut enabled, "Enable mask").changed() {
+        if ui.checkbox(&mut enabled, "Enable shape mask").changed() {
             mask = enabled.then(ClipMask::default);
         }
         if let Some(mask) = &mut mask {
@@ -3838,6 +4350,143 @@ impl Editor {
         }
     }
 
+    fn paint_preview_mask(&mut self, ui: &mut egui::Ui, image: egui::Rect, area: egui::Rect) {
+        let target = self
+            .mask_brush
+            .filter(|_| self.show_inspector && self.inspector_tab == InspectorTab::Mask)
+            .filter(|_| !self.preview.is_playing())
+            .zip(self.selection.clip.as_ref())
+            .and_then(|(restore, id)| {
+                let (row, index) = self.project.location(id)?;
+                let track = &self.project.tracks[row];
+                let clip = &track.clips[index];
+                let valid = track.kind == TrackKind::Video
+                    && !track.muted
+                    && (clip.start..clip.end()).contains(&self.frame)
+                    && clip.mask_strokes.len() < MaskStroke::MAX_STROKES;
+                valid.then_some((restore, clip))
+            });
+        let Some((restore, clip)) = target else {
+            self.mask_stroke = None;
+            return;
+        };
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.mask_brush = None;
+            self.mask_stroke = None;
+            return;
+        }
+        let frame = self.frame - clip.start;
+        let scale = clip.animated_value(AnimatedProperty::Scale, frame);
+        let angle = clip.animated_value(AnimatedProperty::Rotation, frame);
+        let rotation = egui::emath::Rot2::from_angle(angle.to_radians());
+        let [x, y] = clip.position_at(frame);
+        let center = image.center() + vec2(x * image.width(), y * image.height());
+        let shown = image.intersect(area);
+        let response = ui.interact(shown, ui.id().with("mask_brush"), Sense::click_and_drag());
+        let (hover, press, release, down) = ui.input(|input| {
+            let mut press = None;
+            let mut release = None;
+            for event in &input.events {
+                if let egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pos,
+                    pressed,
+                    ..
+                } = event
+                {
+                    if *pressed {
+                        press = Some(*pos);
+                    } else {
+                        release = Some(*pos);
+                    }
+                }
+            }
+            (
+                input.pointer.interact_pos(),
+                press,
+                release,
+                input.pointer.primary_down(),
+            )
+        });
+        let to_canvas = |pointer: egui::Pos2| {
+            let relative = rotation.inverse() * (pointer - center) / scale;
+            [
+                0.5 + relative.x / image.width(),
+                0.5 + relative.y / image.height(),
+            ]
+        };
+        let in_canvas = |point: &[f32; 2]| point.iter().all(|v| (0.0..=1.0).contains(v));
+        if let Some(point) = press
+            .filter(|pos| shown.contains(*pos) && ui.ctx().layer_id_at(*pos) == Some(ui.layer_id()))
+            .map(to_canvas)
+            .filter(in_canvas)
+        {
+            self.mask_stroke = Some(MaskStroke {
+                radius: self.mask_radius,
+                restore,
+                points: vec![point],
+            });
+        }
+        let painter = ui.painter().with_clip_rect(shown);
+        let color = if restore {
+            LIME
+        } else {
+            Color32::from_rgb(255, 138, 138)
+        };
+        if let Some(stroke) = &mut self.mask_stroke {
+            if let Some([x, y]) = release.or(hover).map(to_canvas) {
+                let next = [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)];
+                let [last_x, last_y] = stroke.points[stroke.points.len() - 1];
+                let delta = vec2(
+                    (next[0] - last_x) * image.width(),
+                    (next[1] - last_y) * image.height(),
+                );
+                if delta.length() * scale >= 0.75 {
+                    if stroke.points.len() == MaskStroke::MAX_POINTS {
+                        stroke.points = stroke.points.iter().step_by(2).copied().collect();
+                    }
+                    stroke.points.push(next);
+                }
+            }
+            let radius = stroke.radius * image.width().min(image.height()) * scale;
+            let displayed: Vec<_> = stroke
+                .points
+                .iter()
+                .map(|[x, y]| {
+                    center
+                        + rotation
+                            * vec2((x - 0.5) * image.width(), (y - 0.5) * image.height())
+                            * scale
+                })
+                .collect();
+            let ink = color.gamma_multiply(0.45);
+            painter.circle_filled(displayed[0], radius, ink);
+            painter.add(egui::Shape::line(displayed, Stroke::new(radius * 2.0, ink)));
+        }
+        if let Some(pointer) =
+            hover.filter(|p| in_canvas(&to_canvas(*p)) && response.contains_pointer())
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            let radius = self.mask_radius * image.width().min(image.height()) * scale;
+            painter.circle_stroke(pointer, radius, Stroke::new(1.5, color));
+        }
+        if release.is_some()
+            && let Some(stroke) = self.mask_stroke.take()
+        {
+            let id = clip.id.clone();
+            let result = self.commit(|project| {
+                let (row, index) = project.location(&id).context("Select a clip.")?;
+                project.tracks[row].clips[index].mask_strokes.push(stroke);
+                Ok(())
+            });
+            if let Err(error) = result {
+                self.error("Paint clip mask", error);
+            }
+        } else if !down {
+            self.mask_stroke = None;
+        }
+    }
+
     fn monitor(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Preview");
@@ -3923,6 +4572,7 @@ impl Editor {
                     StrokeKind::Inside,
                 );
             }
+            self.paint_preview_mask(ui, image_rect, area);
         } else {
             let label = if self.project.duration() == 0 {
                 "The timeline is empty"
@@ -4147,6 +4797,45 @@ impl Editor {
                     ui.close();
                     self.group_selection();
                 }
+                if ui
+                    .add_enabled(
+                        (2..=9).contains(&self.multi_selection.len()),
+                        egui::Button::new("Sync selected clips by audio"),
+                    )
+                    .on_hover_text("Align with the last clip selected")
+                    .clicked()
+                {
+                    ui.close();
+                    if let Err(error) = self.sync_selected_audio(ui.ctx()) {
+                        self.error("Sync clips by audio", error);
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        (2..=9).contains(&self.multi_selection.len()),
+                        egui::Button::new("Sync selected clips by points"),
+                    )
+                    .on_hover_text("Align the clips using their marked sync points")
+                    .clicked()
+                {
+                    ui.close();
+                    if let Err(error) = self.sync_selected_markers() {
+                        self.error("Sync clips by points", error);
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        (2..=9).contains(&self.multi_selection.len()),
+                        egui::Button::new("Edit camera angles…"),
+                    )
+                    .on_hover_text("Use the last clip selected as the reference angle")
+                    .clicked()
+                {
+                    ui.close();
+                    if let Err(error) = self.start_camera_edit() {
+                        self.error("Edit camera angles", error);
+                    }
+                }
                 let row = self.selection.row;
                 let label = if self.project.tracks[row].muted {
                     "Enable selected track"
@@ -4237,11 +4926,11 @@ impl Editor {
         if let Some(frame) = events.seek {
             self.seek(frame);
         }
-        if let Some(placement) = events.edit {
-            if let Some((row, index)) = self.project.location(&placement.id) {
-                let gain = self.project.tracks[row].clips[index].gain;
-                self.apply_placement(placement, gain);
-            }
+        if let Some(placement) = events.edit
+            && let Some((row, index)) = self.project.location(&placement.id)
+        {
+            let gain = self.project.tracks[row].clips[index].gain;
+            self.apply_placement(placement, gain);
         }
         if let Some((id, action)) = events.action
             && let Some((row, _)) = self.project.location(&id)
@@ -4422,6 +5111,7 @@ impl eframe::App for Editor {
             .frame(theme::panel())
             .show(ui, |ui| self.monitor(ui));
         self.voiceover_dialog(&ctx);
+        self.camera_editor(&ctx);
         self.recovery_dialog(&ctx);
         if let Some(browser) = &mut self.font_browser
             && let Some(choice) = browser.show(&ctx)

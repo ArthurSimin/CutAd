@@ -2,9 +2,10 @@ use crate::effects::{Effect, Transition, TransitionKind};
 use crate::fonts::FontRef;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Write};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -148,6 +149,29 @@ impl VideoGeometry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PreviewProxy {
+    pub path: PathBuf,
+    pub(crate) source_bytes: u64,
+    pub(crate) source_modified: std::time::SystemTime,
+    pub(crate) proxy_bytes: u64,
+    pub(crate) proxy_modified: std::time::SystemTime,
+}
+
+impl PreviewProxy {
+    pub fn matches_source(&self, source: &Path) -> bool {
+        let matches = |path: &Path, size, modified| {
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.len() == size
+                    && metadata.modified().ok() == Some(modified)
+            })
+        };
+        matches(source, self.source_bytes, self.source_modified)
+            && matches(&self.path, self.proxy_bytes, self.proxy_modified)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Asset {
     pub id: String,
     pub path: Option<PathBuf>,
@@ -159,6 +183,8 @@ pub struct Asset {
     pub audio_offset_samples: i64,
     #[serde(default)]
     pub preview_seek: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<PreviewProxy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<VideoGeometry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +211,7 @@ impl Asset {
                 .into_owned(),
             audio_offset_samples: 0,
             preview_seek: false,
+            proxy: None,
             geometry: None,
             title: None,
         }
@@ -200,6 +227,7 @@ impl Asset {
             label: label.into(),
             audio_offset_samples: 0,
             preview_seek: false,
+            proxy: None,
             geometry: None,
             title: None,
         }
@@ -427,6 +455,30 @@ impl Default for ClipMask {
             feather: 0.0,
             invert: false,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MaskStroke {
+    /// Radius as a fraction of the shorter canvas edge.
+    pub radius: f32,
+    pub restore: bool,
+    /// Coordinates in the clip's canvas before scale, rotation, and translation.
+    pub points: Vec<[f32; 2]>,
+}
+
+impl MaskStroke {
+    pub const MAX_STROKES: usize = 128;
+    pub const MAX_POINTS: usize = 512;
+
+    fn valid(&self) -> bool {
+        (0.005..=0.25).contains(&self.radius)
+            && (1..=Self::MAX_POINTS).contains(&self.points.len())
+            && self
+                .points
+                .iter()
+                .flatten()
+                .all(|v| (0.0..=1.0).contains(v))
     }
 }
 
@@ -695,6 +747,8 @@ pub struct Clip {
     pub asset_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_source: Option<u32>,
     pub start: u32,
     pub source: u32,
     #[serde(default, skip_serializing_if = "zero_subframe")]
@@ -737,6 +791,8 @@ pub struct Clip {
     pub chroma_key: Option<ChromaKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<ClipMask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_strokes: Vec<MaskStroke>,
     #[serde(default)]
     pub adjustment: ColorAdjustment,
     #[serde(default, skip_serializing_if = "no_hue_adjustments")]
@@ -757,6 +813,7 @@ impl Clip {
             id: new_id(),
             asset_id,
             group_id: None,
+            sync_source: None,
             start,
             source,
             source_subframe: 0,
@@ -780,6 +837,7 @@ impl Clip {
             scale_animation: ScalarAnimation::default(),
             chroma_key: None,
             mask: None,
+            mask_strokes: Vec::new(),
             adjustment: ColorAdjustment::default(),
             hue_adjustments: [HueAdjustment::default(); 6],
             color_lut: None,
@@ -797,6 +855,29 @@ impl Clip {
         self.visual_fade.set(in_frames, out_frames, self.length);
     }
 
+    fn split_tail(&mut self, frame: u32) -> Self {
+        let offset = frame - self.start;
+        let mut tail = self.clone();
+        tail.id = new_id();
+        tail.start = frame;
+        tail.set_source_units(self.source_units_at(i64::from(offset)));
+        tail.length -= offset;
+        if !tail.position_animation.is_empty() {
+            tail.position_animation.offset =
+                tail.position_animation.offset.saturating_add(offset as i32);
+        }
+        tail.opacity_animation.shift(offset as i32);
+        tail.rotation_animation.shift(offset as i32);
+        tail.scale_animation.shift(offset as i32);
+        tail.gain_animation.shift(offset as i32);
+        tail.audio_fade = self.audio_fade.split(offset, tail.length);
+        tail.visual_fade = self.visual_fade.split(offset, tail.length);
+        tail.transition = None;
+        self.length = offset;
+        self.speed_remainder = 0;
+        tail
+    }
+
     pub fn source_units_at(&self, local: i64) -> i64 {
         let start = i64::from(self.source) * 100 + i64::from(self.source_subframe);
         start
@@ -805,6 +886,16 @@ impl Clip {
             } else {
                 local * i64::from(self.speed_percent)
             }
+    }
+
+    pub fn sync_offset(&self) -> Option<u32> {
+        let distance = i64::from(self.sync_source?) - self.source_units_at(0);
+        if self.freeze || self.slot || distance < 0 {
+            return None;
+        }
+        let speed = i64::from(self.speed_percent.max(1));
+        let frame = u32::try_from((distance + speed / 2) / speed).ok()?;
+        (frame < self.length).then_some(frame)
     }
 
     pub fn source_frame_at(&self, local: i64) -> u32 {
@@ -990,6 +1081,7 @@ impl Clip {
                 .clone_from(&source.rotation_animation);
             self.scale_animation.clone_from(&source.scale_animation);
             self.mask = source.mask;
+            self.mask_strokes.clone_from(&source.mask_strokes);
             self.chroma_key = source.chroma_key;
             self.adjustment = source.adjustment;
             self.hue_adjustments = source.hue_adjustments;
@@ -1052,6 +1144,8 @@ pub struct Track {
     pub kind: TrackKind,
     pub clips: Vec<Clip>,
     pub muted: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 impl Track {
@@ -1061,6 +1155,7 @@ impl Track {
             kind,
             clips: Vec::new(),
             muted: false,
+            archived: false,
         }
     }
 }
@@ -1131,7 +1226,13 @@ impl Project {
     pub(crate) fn source_paths(&self) -> impl Iterator<Item = &Path> {
         self.assets
             .iter()
-            .filter_map(|asset| asset.path.as_deref())
+            .flat_map(|asset| {
+                asset
+                    .path
+                    .as_deref()
+                    .into_iter()
+                    .chain(asset.proxy.iter().map(|proxy| proxy.path.as_path()))
+            })
             .chain(
                 self.tracks
                     .iter()
@@ -1143,7 +1244,13 @@ impl Project {
     fn source_paths_mut(&mut self) -> impl Iterator<Item = &mut PathBuf> {
         self.assets
             .iter_mut()
-            .filter_map(|asset| asset.path.as_mut())
+            .flat_map(|asset| {
+                asset
+                    .path
+                    .as_mut()
+                    .into_iter()
+                    .chain(asset.proxy.iter_mut().map(|proxy| &mut proxy.path))
+            })
             .chain(
                 self.tracks
                     .iter_mut()
@@ -1155,6 +1262,7 @@ impl Project {
     pub fn duration(&self) -> u32 {
         self.tracks
             .iter()
+            .filter(|track| !track.archived || !track.muted)
             .flat_map(|track| &track.clips)
             .map(Clip::end)
             .max()
@@ -1168,7 +1276,7 @@ impl Project {
     pub fn source_video(&self) -> Option<VideoGeometry> {
         self.tracks
             .iter()
-            .filter(|track| track.kind == TrackKind::Video)
+            .filter(|track| track.kind == TrackKind::Video && (!track.archived || !track.muted))
             .flat_map(|track| &track.clips)
             .filter_map(|clip| {
                 self.asset(&clip.asset_id)
@@ -1197,28 +1305,179 @@ impl Project {
             clip.start < frame && frame < clip.end(),
             "Place the playhead inside the clip."
         );
-        let offset = frame - clip.start;
-        let mut tail = clip.clone();
-        tail.id = new_id();
-        tail.start = frame;
-        tail.set_source_units(clip.source_units_at(i64::from(offset)));
-        tail.length -= offset;
-        if !tail.position_animation.is_empty() {
-            tail.position_animation.offset =
-                tail.position_animation.offset.saturating_add(offset as i32);
-        }
-        tail.opacity_animation.shift(offset as i32);
-        tail.rotation_animation.shift(offset as i32);
-        tail.scale_animation.shift(offset as i32);
-        tail.gain_animation.shift(offset as i32);
-        tail.audio_fade = clip.audio_fade.split(offset, tail.length);
-        tail.visual_fade = clip.visual_fade.split(offset, tail.length);
-        tail.transition = None;
-        clip.length = offset;
-        clip.speed_remainder = 0;
+        let tail = clip.split_tail(frame);
         let id = tail.id.clone();
         self.tracks[row].clips.insert(column + 1, tail);
         Ok(id)
+    }
+
+    /// Apply signed start offsets relative to the first clip without changing source trims.
+    pub fn align_clip_starts(&mut self, clips: &[(&str, i32)]) -> Result<()> {
+        let Some((&(anchor, 0), moved)) = clips.split_first() else {
+            bail!("Choose a reference clip for synchronization.");
+        };
+        ensure!(!moved.is_empty(), "Select at least two clips to sync.");
+        let (anchor_row, anchor_index) = self
+            .location(anchor)
+            .context("Reference clip is missing.")?;
+        let start = i64::from(self.tracks[anchor_row].clips[anchor_index].start);
+        let mut rows = HashSet::from([anchor_row]);
+        let mut placements = Vec::with_capacity(moved.len());
+        for &(id, offset) in moved {
+            let (row, index) = self.location(id).context("A clip is missing.")?;
+            ensure!(rows.insert(row), "Select at most one clip per track.");
+            let clip = &self.tracks[row].clips[index];
+            ensure!(
+                clip.group_id.is_none(),
+                "Ungroup clips before syncing them."
+            );
+            let position = start + i64::from(offset);
+            let end = position + i64::from(clip.length);
+            ensure!(
+                position >= 0 && end <= i64::from(MAX_FRAMES),
+                "The synchronized clip would be outside the timeline. Move the reference clip and try again."
+            );
+            ensure!(
+                self.tracks[row].clips.iter().all(|other| {
+                    other.id == id
+                        || i64::from(other.end()) <= position
+                        || i64::from(other.start) >= end
+                }),
+                "A synchronized clip would overlap another clip on the same track."
+            );
+            placements.push((row, index, position as u32));
+        }
+        for (row, index, position) in placements {
+            self.tracks[row].clips[index].start = position;
+        }
+        Ok(())
+    }
+
+    pub fn align_clip_markers(&mut self, clips: &[&str]) -> Result<()> {
+        let mut markers = clips.iter().map(|id| {
+            let (row, index) = self.location(id).context("A camera clip is missing.")?;
+            self.tracks[row].clips[index]
+                .sync_offset()
+                .map(|offset| (*id, offset as i32))
+                .context("Set a sync point inside each selected clip before aligning.")
+        });
+        let anchor = markers.next().context("Select a reference clip.")??;
+        let mut placement = vec![(anchor.0, 0)];
+        for other in markers {
+            let (id, position) = other?;
+            placement.push((id, anchor.1 - position));
+        }
+        self.align_clip_starts(&placement)
+    }
+
+    /// Compile multicamera choices into editable timeline cuts and retain the original angles.
+    pub fn assemble_camera_angles(
+        &mut self,
+        angles: &[Clip],
+        switches: &BTreeMap<u32, usize>,
+        reference_audio: bool,
+    ) -> Result<String> {
+        ensure!(
+            (2..=9).contains(&angles.len()),
+            "Select two to nine angles."
+        );
+        let reference = &angles[0];
+        let mut rows = HashSet::new();
+        let mut locations = Vec::with_capacity(angles.len());
+        for angle in angles {
+            let (row, index) = self
+                .location(&angle.id)
+                .context("A camera clip is missing.")?;
+            ensure!(
+                rows.insert(row)
+                    && self.tracks[row].kind == TrackKind::Video
+                    && self.tracks[row].clips[index] == *angle
+                    && !angle.slot
+                    && !angle.freeze
+                    && angle.group_id.is_none()
+                    && self
+                        .asset(&angle.asset_id)
+                        .is_some_and(|asset| asset.kind == AssetKind::Video),
+                "Use one ungrouped video clip per track. Reopen the angle editor after editing the source clips."
+            );
+            locations.push((row, index));
+        }
+        let mut result = Track::new("Multicamera cut", TrackKind::Video);
+        let mut choices = switches.clone();
+        choices.entry(reference.start).or_insert(0);
+        let assemble = |track: &mut Track, angle: &Clip, start: u32, end: u32| {
+            let mut cut = angle.clone();
+            if cut.start < start {
+                cut = cut.split_tail(start);
+            }
+            if end < cut.end() {
+                cut.split_tail(end);
+            }
+            cut.id = new_id();
+            cut.transition = None;
+            if reference_audio {
+                cut.gain = 0.0;
+                cut.gain_animation = ScalarAnimation::default();
+            }
+            track.clips.push(cut);
+        };
+        let mut cuts = choices.iter().peekable();
+        while let Some((&start, &angle)) = cuts.next() {
+            let end = cuts.peek().map_or(reference.end(), |&(frame, _)| *frame);
+            let source = angles.get(angle).context("Invalid camera angle.")?;
+            ensure!(
+                (reference.start..reference.end()).contains(&start)
+                    && end <= reference.end()
+                    && (source.start..source.end()).contains(&start),
+                "A camera cut is outside its source or the reference timeline range."
+            );
+            let cut_end = end.min(source.end());
+            assemble(&mut result, source, start, cut_end);
+            if cut_end < end {
+                assemble(&mut result, reference, cut_end, end);
+            }
+        }
+        let audio = if reference_audio {
+            ensure!(
+                self.asset(&reference.asset_id)
+                    .is_some_and(|asset| asset.audio),
+                "The reference angle has no source audio."
+            );
+            let mut audio = reference.clone();
+            audio.id = new_id();
+            audio.transition = None;
+            Some(Track {
+                clips: vec![audio],
+                ..Track::new("Multicamera audio", TrackKind::Audio)
+            })
+        } else {
+            None
+        };
+        let mut archives = Vec::new();
+        for ((row, index), angle) in locations.into_iter().zip(angles) {
+            let track = &mut self.tracks[row];
+            if track.clips.len() == 1 {
+                track.muted = true;
+                track.archived = true;
+            } else {
+                let name = self
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == angle.asset_id)
+                    .map_or("Camera source", |asset| asset.label.as_str());
+                let mut archive = Track::new(name, TrackKind::Video);
+                archive.clips.push(track.clips.remove(index));
+                archive.muted = true;
+                archive.archived = true;
+                archives.push(archive);
+            }
+        }
+        let first = result.clips[0].id.clone();
+        self.tracks
+            .insert(rows.into_iter().max().unwrap_or(0) + 1, result);
+        self.tracks.extend(audio);
+        self.tracks.extend(archives);
+        Ok(first)
     }
 
     /// Insert a silent frame hold and move the remaining clips on the same track forward.
@@ -1478,6 +1737,7 @@ impl Project {
         clip.asset_id.clone_from(&asset.id);
         clip.source = 0;
         clip.source_subframe = 0;
+        clip.sync_source = None;
         clip.slot = false;
         clip.freeze &= asset.kind == AssetKind::Video;
         if matches!(asset.kind, AssetKind::Image | AssetKind::Text) {
@@ -1801,6 +2061,9 @@ impl Project {
                         && clip.source <= MAX_FRAMES
                         && clip.source_subframe < 100
                         && clip
+                            .sync_source
+                            .is_none_or(|frame| frame <= MAX_FRAMES * 100)
+                        && clip
                             .group_id
                             .as_ref()
                             .is_none_or(|id| !id.is_empty() && id.len() <= 64)
@@ -1891,6 +2154,11 @@ impl Project {
                     "Invalid clip mask."
                 );
                 ensure!(
+                    clip.mask_strokes.len() <= MaskStroke::MAX_STROKES
+                        && clip.mask_strokes.iter().all(MaskStroke::valid),
+                    "Invalid clip mask brush strokes."
+                );
+                ensure!(
                     clip.audio_fade.valid() && clip.visual_fade.valid(),
                     "Invalid clip fade settings."
                 );
@@ -1964,6 +2232,89 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// Copy local media and LUTs into a self-contained folder with a relative-path project.
+pub fn save_portable_copy(
+    project: &Project,
+    parent: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<PathBuf> {
+    let canceled = || -> Result<()> {
+        ensure!(!cancel.load(Ordering::Relaxed), "Portable copy canceled.");
+        Ok(())
+    };
+    canceled()?;
+    project.validate()?;
+    let mut copy = project.clone();
+    for asset in &mut copy.assets {
+        asset.proxy = None;
+    }
+    let parent = std::path::absolute(parent)?;
+    let folder = tempfile::Builder::new()
+        .prefix("CutAd Project-")
+        .tempdir_in(parent)?;
+    let media = folder.path().join("Media");
+    std::fs::create_dir(&media)?;
+
+    let mut sources = HashMap::<PathBuf, (PathBuf, std::fs::Metadata)>::new();
+    let mut total = 0_u64;
+    for path in copy.source_paths_mut() {
+        canceled()?;
+        let original = path
+            .canonicalize()
+            .with_context(|| format!("Relink or locate {} before copying.", path.display()))?;
+        if !sources.contains_key(&original) {
+            let metadata = original.metadata()?;
+            ensure!(
+                metadata.is_file(),
+                "Choose a regular file for {}.",
+                path.display()
+            );
+            let extension = path.extension().and_then(|ext| ext.to_str()).filter(|ext| {
+                !ext.is_empty()
+                    && ext.len() <= 12
+                    && ext.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            });
+            let mut output = media.join(format!("Media-{:05}", sources.len() + 1));
+            if let Some(extension) = extension {
+                output.set_extension(extension);
+            }
+            total = total.saturating_add(metadata.len());
+            sources.insert(original.clone(), (output, metadata));
+        }
+        path.clone_from(&sources[&original].0);
+    }
+
+    let mut copied = 0_u64;
+    let mut buffer = vec![0; 1024 * 1024];
+    for (source, (destination, before)) in sources {
+        let mut input = std::fs::File::open(&source)?;
+        let mut output = std::fs::File::create_new(destination)?;
+        loop {
+            canceled()?;
+            let size = input.read(&mut buffer)?;
+            if size == 0 {
+                break;
+            }
+            output.write_all(&buffer[..size])?;
+            copied = copied.saturating_add(size as u64);
+            progress((copied.saturating_mul(99) / total.max(1)).min(99) as u8);
+        }
+        let after = input.metadata()?;
+        ensure!(
+            before.len() == after.len() && before.modified()? == after.modified()?,
+            "Source changed while copying {}.",
+            source.display()
+        );
+    }
+    canceled()?;
+    save(&copy, &folder.path().join("Project.cutad"))?;
+    canceled()?;
+    let file = folder.keep().join("Project.cutad");
+    progress(100);
+    Ok(file)
 }
 
 pub fn save(project: &Project, path: &Path) -> Result<()> {

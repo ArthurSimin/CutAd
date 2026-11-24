@@ -58,6 +58,10 @@ pub enum ClipAction {
     Reverse,
     InterpolateMotion,
     Stabilize,
+    CreateProxy,
+    UnlinkProxy,
+    SetSyncPoint,
+    RemoveSyncPoint,
     RemoveBackground,
     SplitScenes,
     DetachAudio,
@@ -282,6 +286,33 @@ impl Timeline {
                                     && asset.is_some_and(|asset| asset.kind == AssetKind::Video),
                             ),
                             (
+                                "Create preview proxy…",
+                                ClipAction::CreateProxy,
+                                !clip.slot
+                                    && track.kind == TrackKind::Video
+                                    && asset.is_some_and(|asset| asset.kind == AssetKind::Video),
+                            ),
+                            (
+                                "Unlink preview proxy",
+                                ClipAction::UnlinkProxy,
+                                asset.is_some_and(|asset| asset.proxy.is_some()),
+                            ),
+                            (
+                                "Set sync point at playhead",
+                                ClipAction::SetSyncPoint,
+                                !clip.freeze
+                                    && !clip.slot
+                                    && (clip.start..clip.end()).contains(&view.frame)
+                                    && asset.is_some_and(|asset| {
+                                        matches!(asset.kind, AssetKind::Video | AssetKind::Audio)
+                                    }),
+                            ),
+                            (
+                                "Remove sync point",
+                                ClipAction::RemoveSyncPoint,
+                                clip.sync_source.is_some(),
+                            ),
+                            (
                                 "Remove background…",
                                 ClipAction::RemoveBackground,
                                 !clip.freeze
@@ -383,7 +414,9 @@ impl Timeline {
                 FontId::proportional(13.0),
                 TEXT,
             );
-            let track_kind = if track.muted {
+            let track_kind = if track.muted && track.archived {
+                format!("{} · archived", track.kind.label())
+            } else if track.muted {
                 format!("{} · off", track.kind.label())
             } else {
                 track.kind.label().to_owned()
@@ -418,6 +451,7 @@ impl Timeline {
                 MUTED,
             );
         }
+        let clip_strip = painter.with_clip_rect(visible);
         for (row, track) in project.tracks.iter().enumerate() {
             for clip in &track.clips {
                 if self
@@ -444,9 +478,8 @@ impl Timeline {
                     .unwrap_or((row, clip.start));
                 let bounds = clip_rect(rect, scale, paint_row, paint_start, clip.length);
                 paint_clip(
-                    painter,
+                    &clip_strip,
                     bounds,
-                    visible,
                     project,
                     clip,
                     track.kind,
@@ -464,9 +497,8 @@ impl Timeline {
             let p = &drag.proposed;
             let bounds = clip_rect(rect, scale, p.row, p.start, p.length);
             paint_clip(
-                painter,
+                &clip_strip,
                 bounds,
-                visible,
                 project,
                 &project.tracks[row].clips[column],
                 project.tracks[p.row].kind,
@@ -613,13 +645,13 @@ fn update_drag(drag: &mut Drag, view: &View<'_>, rect: Rect, scale: f32, cursor:
 fn paint_clip(
     painter: &egui::Painter,
     bounds: Rect,
-    visible: Rect,
     project: &Project,
     clip: &Clip,
     kind: TrackKind,
     selected: bool,
     thumbnails: &mut Thumbnails,
 ) {
+    let visible = painter.clip_rect();
     if !visible.intersects(bounds) {
         return;
     }
@@ -669,6 +701,17 @@ fn paint_clip(
             label.push_str(&format!("  ·  {} FX", clip.effects.len()));
         }
         let clip_painter = painter.with_clip_rect(bounds.shrink(2.0).intersect(visible));
+        if let Some(frame) = clip.sync_offset() {
+            let x = bounds.left() + bounds.width() * frame as f32 / clip.length as f32;
+            let x = x.clamp(bounds.left() + 5.0, bounds.right() - 5.0);
+            let center = pos2(x, bounds.top() + 4.0);
+            let offsets = [vec2(-4.0, 0.0), vec2(4.0, 0.0), vec2(0.0, 6.0)];
+            clip_painter.add(egui::Shape::convex_polygon(
+                offsets.into_iter().map(|offset| center + offset).collect(),
+                Color32::from_rgb(244, 180, 71),
+                Stroke::new(0.7, Color32::BLACK),
+            ));
+        }
         let thumbnails_top = bounds.top() + 19.0;
         let wave = asset.audio && !clip.slot && !clip.freeze && bounds.width() > 39.0;
         let wave_height = if kind == TrackKind::Audio { 20.0 } else { 9.0 };

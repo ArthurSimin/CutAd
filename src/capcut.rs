@@ -103,13 +103,14 @@ pub fn import(
         ..Project::default()
     };
     let canvas = &document["canvas_config"];
-    if let (Some(width), Some(height)) = (canvas["width"].as_u64(), canvas["height"].as_u64()) {
-        if width <= 4096 && height <= 4096 {
-            let (width, height) = (width as u32 & !1, height as u32 & !1);
-            if valid_canvas(width, height) {
-                project.width = width;
-                project.height = height;
-            }
+    if let (Some(width), Some(height)) = (canvas["width"].as_u64(), canvas["height"].as_u64())
+        && width <= 4096
+        && height <= 4096
+    {
+        let (width, height) = (width as u32 & !1, height as u32 & !1);
+        if valid_canvas(width, height) {
+            project.width = width;
+            project.height = height;
         }
     }
     let mut warnings = Vec::new();

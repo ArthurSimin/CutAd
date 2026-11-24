@@ -44,6 +44,10 @@ The GitHub Actions workflow can also run the background removal and reframe test
 6. New projects follow the first video’s dimensions within the 4096-pixel canvas limit. For an existing edit, choose **Canvas → Match first video**. Export uses the canvas dimensions by default. Choose **MKV · Lossless** for FFV1 video with 4:4:4 chroma and FLAC audio, or **MP4** for wider playback compatibility. The compositing pipeline works in 8-bit SDR with a 48 kHz stereo mix. Video export supports 24, 30, 60, and 120 fps. Supported high frame rates are rendered from source frames before encoding.
 7. Save a `.cutad` project. Media inside the project folder is stored with relative paths. Keep that folder together when moving projects.
 
+For large 8-bit SDR videos, right-click a timeline clip and choose **Create preview proxy…**. CutAd saves a smaller video for reduced-resolution previews. Full-canvas preview, audio playback, and export read the original media. **Unlink preview proxy** removes the association without deleting the file.
+
+Use **Project → Save portable copy…** to collect source media and LUTs into a new folder with relative paths. Open `Project.cutad` inside that folder. Install any custom fonts used by the project on the destination computer.
+
 See the [CapCut workflow inventory](CAPCUT_WORKFLOWS.md) and [setup evidence](SETUP_EVIDENCE.md) for the public feature reference and installer inspection.
 
 In **Export video**, choose the entire edit, the selected clip’s timeline span, or custom In and Out times. Range export includes every track in that span.
@@ -56,6 +60,12 @@ Use **Video → Blend** to merge a visual clip with the layers beneath it. The *
 Open **Project → Open recent** to return to saved edits. CutAd backs up unsaved changes in a separate local draft. If the app exits unexpectedly, choose the recovered draft at startup or use **Project → Recover autosaved draft…**. Save the recovered edit to a project file when you are ready.
 
 Hold **Ctrl** while clicking timeline clips to select several, then press **Ctrl+G** or choose **Tracks → Group selected clips**. Drag a member to move the group. Right-click a member and choose **Ungroup** to move clips separately again.
+
+To align camera footage or an external recording, select two to nine clips on separate tracks. Select the reference clip last, then choose **Tracks → Sync selected clips by audio**. CutAd searches the first 45 seconds of each selection for matching sound, with at least three seconds of overlap and a maximum offset of 30 seconds. Source trims stay in place.
+
+For silent footage or a visible clap, place the playhead on the cue in each clip and choose **Set sync point at playhead** from its clip menu. Select the clips with the reference last and choose **Tracks → Sync selected clips by points**.
+
+With the aligned video clips still selected, choose **Tracks → Edit camera angles…**. Scrub to the cut and click an angle preview. **Apply angle cuts** creates editable timeline clips and keeps the source angles on muted tracks. By default the selected reference angle supplies continuous audio when it has an audio stream. If an angle ends before the next cut, the edit returns to the reference angle.
 
 For narration, click **Voiceover…** above the timeline, choose a microphone, and select where to save the WAV. You can play the current edit while recording. **Stop and keep** adds the take at the original playhead position on an available audio track. **Discard** drops the take before it is saved.
 
@@ -72,6 +82,8 @@ In the export dialog, **Title and cover** lets you write a title into MP4, WebM,
 Install [rembg](https://github.com/danielgatis/rembg) with its CPU dependencies in a Python 3.12 environment using `python -m pip install "rembg[cpu]==2.0.69"`. Set `CUTAD_CUTOUT_PYTHON` to that interpreter before launching CutAd if the environment is outside your normal PATH. Obtain compatible [U²-Net or U²-Net Lite ONNX weights](https://github.com/danielgatis/rembg/releases/tag/v0.0.0) and keep them on disk.
 
 Select a video or image and open **Mask → Remove background…**. The same command is in the timeline clip menu. Choose the local model and save the cutout. Run it offline once dependencies and weights are installed. CutAd switches the selected clip to a transparent PNG or an 8-bit SDR lossless Matroska file with audio. Its timeline placement and edit settings carry forward, and Undo restores the original source. Put another clip underneath to see it through the transparent areas. Video runs the model on each frame, so processing time and edge consistency depend on the footage, model, and CPU.
+
+To refine a clip by hand, pause inside the clip and select **Mask → Erase brush** or **Restore brush**. Paint in Preview. The same mask applies across the clip and follows its transform. Restore recovers pixels hidden by the clip mask when those pixels exist in the source. Every stroke can be undone.
 
 For **Auto reframe…**, set the project’s canvas ratio, select a clip, and open **Animation**. Choose the same local model. CutAd samples the clip, scales it to fill the canvas, and writes editable position keyframes that follow the detected foreground. This replaces the clip’s existing scale and position animation in one undoable edit. Reset rotation and crop before applying it.
 

@@ -3,8 +3,8 @@
 use crate::effects::Transition;
 use crate::fonts;
 use crate::project::{
-    Asset, AssetKind, Clip, ClipMask, ColorAdjustment, FPS, MAX_FRAMES, MaskShape, Project,
-    TextAlign, Title, TitleStyle, TrackKind, Transform, VideoGeometry, same_path, seconds,
+    Asset, AssetKind, Clip, ClipMask, ColorAdjustment, FPS, MAX_FRAMES, MaskShape, MaskStroke,
+    Project, TextAlign, Title, TitleStyle, TrackKind, Transform, VideoGeometry, same_path, seconds,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -264,6 +264,7 @@ struct Layer<'a> {
     clip: &'a Clip,
     asset: &'a Asset,
     input: Option<usize>,
+    video_input: Option<usize>,
     mask_input: Option<usize>,
     font: Option<String>,
     lut: Option<String>,
@@ -275,18 +276,19 @@ struct Layer<'a> {
     transition: Option<Transition>,
 }
 
-fn stage_mask(path: &Path, mask: ClipMask, raster: Raster, cancel: &AtomicBool) -> Result<()> {
-    let (width, height) = (raster.width, raster.height);
-    let (w, h) = (width as f64, height as f64);
+fn paint_shape(
+    pixels: &mut [u8],
+    raster: Raster,
+    mask: ClipMask,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let (w, h) = (raster.width as f64, raster.height as f64);
     let half_width = w * f64::from(mask.width) * 0.5;
     let half_height = h * f64::from(mask.height) * 0.5;
     let (cx, cy) = (w * f64::from(mask.x), h * f64::from(mask.y));
     let (sin, cos) = f64::from(mask.rotation).to_radians().sin_cos();
     let feather = w.min(h) * f64::from(mask.feather);
-    let mut output = BufWriter::new(File::create(path)?);
-    write!(output, "P5\n{width} {height}\n255\n")?;
-    let mut row = vec![0; width];
-    for y in 0..height {
+    for (y, row) in pixels.chunks_exact_mut(raster.width).enumerate() {
         if y % 64 == 0 {
             check_cancel(cancel)?;
         }
@@ -327,8 +329,88 @@ fn stage_mask(path: &Path, mask: ClipMask, raster: Raster, cancel: &AtomicBool) 
             let value = (255.0 * coverage).round() as u8;
             *alpha = if mask.invert { 255 - value } else { value };
         }
-        output.write_all(&row)?;
     }
+    Ok(())
+}
+
+fn paint_stroke(
+    pixels: &mut [u8],
+    raster: Raster,
+    stroke: &MaskStroke,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let (width, height) = (raster.width, raster.height);
+    let radius = stroke.radius * width.min(height) as f32;
+    let bounds = |start: f32, end: f32, limit: usize| {
+        let low = (start.min(end) - radius - 1.0).floor().max(0.0) as usize;
+        let high = ((start.max(end) + radius + 1.0).ceil() as usize).min(limit);
+        low..high
+    };
+    let points: Vec<_> = stroke
+        .points
+        .iter()
+        .map(|[x, y]| [x * width as f32, y * height as f32])
+        .collect();
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for [x, y] in &points {
+        min = [min[0].min(*x), min[1].min(*y)];
+        max = [max[0].max(*x), max[1].max(*y)];
+    }
+    let columns = bounds(min[0], max[0], width);
+    let rows = bounds(min[1], max[1], height);
+    let stride = columns.len();
+    let mut coverage = vec![0; stride * rows.len()];
+    let ends = points.iter().skip(1).chain(points.last());
+    for ([x0, y0], [x1, y1]) in points.iter().zip(ends) {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let length_squared = dx * dx + dy * dy;
+        for y in bounds(*y0, *y1, height) {
+            if y % 64 == 0 {
+                check_cancel(cancel)?;
+            }
+            for x in bounds(*x0, *x1, width) {
+                let index = (y - rows.start) * stride + x - columns.start;
+                if coverage[index] == 255 {
+                    continue;
+                }
+                let (px, py) = (x as f32 + 0.5 - x0, y as f32 + 0.5 - y0);
+                let t = if length_squared > 0.0 {
+                    ((px * dx + py * dy) / length_squared).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (px, py) = (px - t * dx, py - t * dy);
+                let distance = (px * px + py * py).sqrt();
+                let alpha = ((radius + 0.5 - distance).clamp(0.0, 1.0) * 255.0).round() as u8;
+                coverage[index] = coverage[index].max(alpha);
+            }
+        }
+    }
+    let target = if stroke.restore { 255 } else { 0 };
+    for (row, brush_row) in rows.zip(coverage.chunks_exact(stride)) {
+        let start = row * width + columns.start;
+        for (alpha, brush) in pixels[start..start + stride].iter_mut().zip(brush_row) {
+            let brush = u16::from(*brush);
+            *alpha = ((u16::from(*alpha) * (255 - brush) + target * brush + 127) / 255) as u8;
+        }
+    }
+    Ok(())
+}
+
+fn stage_mask(path: &Path, clip: &Clip, raster: Raster, cancel: &AtomicBool) -> Result<()> {
+    let (width, height) = (raster.width, raster.height);
+    let mut pixels = vec![255; width * height];
+    if let Some(mask) = clip.mask {
+        paint_shape(&mut pixels, raster, mask, cancel)?;
+    }
+    for stroke in &clip.mask_strokes {
+        check_cancel(cancel)?;
+        paint_stroke(&mut pixels, raster, stroke, cancel)?;
+    }
+    let mut output = BufWriter::new(File::create(path)?);
+    write!(output, "P5\n{width} {height}\n255\n")?;
+    output.write_all(&pixels)?;
     Ok(output.flush()?)
 }
 
@@ -559,11 +641,10 @@ pub fn render_timeline_section(
         destination,
         settings,
         range,
-        None,
         if settings.format == Format::Gif {
             RenderPass::Gif(settings.fps)
         } else {
-            RenderPass::Timeline
+            RenderPass::Timeline(None)
         },
         cancel,
         progress,
@@ -600,7 +681,6 @@ pub fn render_with_details(
         destination,
         settings,
         range,
-        None,
         RenderPass::Delivery(details),
         cancel,
         progress,
@@ -680,7 +760,6 @@ pub fn render_audio_mix(
         destination,
         Output::new(Format::Preview),
         range,
-        None,
         RenderPass::Audio {
             sample_rate: crate::beats::SAMPLE_RATE,
             channels: 1,
@@ -763,7 +842,6 @@ pub fn export_audio(
         destination,
         Output::new(Format::Preview),
         0..project.duration(),
-        None,
         RenderPass::Audio {
             sample_rate: SAMPLE_RATE,
             channels: 2,
@@ -876,6 +954,79 @@ pub fn detect_clip_beats(clip: &Clip, asset: &Asset, cancel: &AtomicBool) -> Res
         crate::beats::detect(BufReader::new(stream), clip.length, cancel)
     })?;
     Ok(beats.into_iter().map(|tick| clip.start + tick).collect())
+}
+
+/// Align selected source audio to the first clip, returning signed timeline tick offsets.
+pub fn audio_sync_offsets(
+    clips: &[(Clip, Asset)],
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<Vec<i32>> {
+    ensure!(
+        (2..=9).contains(&clips.len()),
+        "Select two to nine clips with matching audio."
+    );
+    let scratch = tempfile::tempdir()?;
+    let mut tracks = Vec::with_capacity(clips.len());
+    for (index, (original, asset)) in clips.iter().enumerate() {
+        ensure!(
+            original.length as usize >= crate::audio_sync::MIN_OVERLAP,
+            "Choose clips with at least three seconds of audio."
+        );
+        let mut clip = original.clone();
+        clip.effects.clear();
+        clip.gain_animation = Default::default();
+        clip.audio_fade = Default::default();
+        clip.audio_channels = Default::default();
+        clip.audio_balance = 0;
+        clip.pitch_semitones = 0;
+        let analysis = isolated_clip_audio(&clip, asset)?;
+        let wav = scratch.path().join(format!("sync-{index}.wav"));
+        let frames = clip.length.min(crate::audio_sync::MAX_ANALYSIS);
+        render_audio_mix(&analysis, &wav, 0..frames, cancel, |_| {})?;
+        let mut decoder = command("ffmpeg")?;
+        decoder
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&wav)
+            .args(["-f", "s16le", "pipe:1"]);
+        let signal = cutout_pipe(
+            &mut decoder,
+            scratch.path(),
+            "Decode sync audio",
+            |mut stream| {
+                let sample_rate = crate::beats::SAMPLE_RATE as usize;
+                let count = frames as usize * sample_rate / FPS as usize;
+                let mut pcm = vec![0; count * 2];
+                stream.read_exact(&mut pcm)?;
+                let envelope = (0..frames as usize)
+                    .map(|frame| {
+                        let first = frame * sample_rate / FPS as usize;
+                        let end = (frame + 1) * sample_rate / FPS as usize;
+                        let power =
+                            pcm[first * 2..end * 2]
+                                .chunks_exact(2)
+                                .fold(0.0, |sum, sample| {
+                                    let value =
+                                        f64::from(i16::from_le_bytes([sample[0], sample[1]]))
+                                            / 32768.0;
+                                    sum + value * value
+                                })
+                                / (end - first) as f64;
+                        (power + 1e-9).ln()
+                    })
+                    .collect::<Vec<_>>();
+                Ok(envelope)
+            },
+        )?;
+        tracks.push(signal);
+        progress(((index + 1) * 90 / clips.len()) as u8);
+    }
+    let mut offsets = vec![0];
+    for signal in &tracks[1..] {
+        offsets.push(crate::audio_sync::offset(&tracks[0], signal, cancel)?);
+    }
+    progress(100);
+    Ok(offsets)
 }
 
 /// Write a reversed copy of the selected source span and return its fractional start.
@@ -1266,6 +1417,112 @@ fn prepare_clip_motion(
     prepared.path = Some(destination);
     progress(100);
     Ok((prepared, (first % 100) as u8))
+}
+
+/// Encode a bounded-resolution video proxy with the source's presentation timing.
+pub fn create_preview_proxy(
+    asset: &Asset,
+    destination: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8),
+) -> Result<crate::project::PreviewProxy> {
+    check_cancel(cancel)?;
+    ensure!(asset.kind == AssetKind::Video, "Select a video source.");
+    let source = asset
+        .path
+        .as_deref()
+        .context("Relink the original video first.")?;
+    let destination = std::path::absolute(destination)?;
+    ensure!(
+        !destination.exists() && !same_path(source, &destination),
+        "Choose a new MP4 file for the proxy."
+    );
+    let source_metadata = source.metadata()?;
+    let source_modified = source_metadata.modified()?;
+    let probe = command("ffprobe")?
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            DEMUXERS,
+            "-select_streams",
+            "V:0",
+            "-show_entries",
+            "stream=pix_fmt,color_transfer:stream_tags=alpha_mode",
+            "-of",
+            "json",
+        ])
+        .arg(source)
+        .output()?;
+    ensure!(
+        probe.status.success(),
+        "Could not inspect the original video."
+    );
+    let information: serde_json::Value = serde_json::from_slice(&probe.stdout)?;
+    let stream = &information["streams"][0];
+    ensure!(
+        matches!(
+            stream["pix_fmt"].as_str(),
+            Some(
+                "yuv420p"
+                    | "yuv422p"
+                    | "yuv444p"
+                    | "yuvj420p"
+                    | "yuvj422p"
+                    | "yuvj444p"
+                    | "rgb24"
+                    | "bgr24"
+                    | "rgb0"
+                    | "bgr0"
+                    | "0rgb"
+                    | "0bgr"
+                    | "gray"
+                    | "nv12"
+                    | "nv21"
+            )
+        ) && !matches!(
+            stream["color_transfer"].as_str(),
+            Some("smpte2084" | "arib-std-b67")
+        ) && stream["tags"]["alpha_mode"].as_str() != Some("1"),
+        "Preview proxies currently support opaque 8-bit SDR sources."
+    );
+    let parent = destination
+        .parent()
+        .context("Choose a local proxy folder.")?;
+    let scratch = tempfile::tempdir_in(parent)?;
+    let staged = scratch.path().join("proxy.mp4");
+    let mut ffmpeg = command("ffmpeg")?;
+    ffmpeg.args(["-hide_banner", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
+        "-protocol_whitelist", "file", "-format_whitelist", DEMUXERS, "-i"])
+        .arg(source)
+        .args(["-map", "0:V:0", "-an", "-vf",
+            "scale=w='min(iw,960)':h='min(ih,540)':force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1:flags=area,settb=1/90000,setpts=PTS-STARTPTS",
+            "-fps_mode", "passthrough", "-enc_time_base", "1:90000", "-video_track_timescale", "90000",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-g", "15", "-bf", "0",
+            "-threads:v", "2", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        .arg(&staged);
+    run_media_preparation(&mut ffmpeg, scratch.path(), asset.frames, cancel, &progress)?;
+    let original = source.metadata()?;
+    ensure!(
+        original.modified()? == source_modified && original.len() == source_metadata.len(),
+        "The original video changed during proxy generation."
+    );
+    let proxy_metadata = staged.metadata()?;
+    let proxy = crate::project::PreviewProxy {
+        path: destination.clone(),
+        source_bytes: original.len(),
+        source_modified,
+        proxy_bytes: proxy_metadata.len(),
+        proxy_modified: proxy_metadata.modified()?,
+    };
+    check_cancel(cancel)?;
+    tempfile::TempPath::try_from_path(staged)?
+        .persist_noclobber(&destination)
+        .context("Could not save the preview proxy.")?;
+    progress(100);
+    Ok(proxy)
 }
 
 fn run_media_preparation(
@@ -1702,8 +1959,7 @@ pub fn render_preview_with(
         destination,
         Output::new(Format::Preview),
         range,
-        Some(quality),
-        RenderPass::Timeline,
+        RenderPass::Timeline(Some(quality)),
         cancel,
         |_| {},
     )
@@ -1733,7 +1989,6 @@ pub fn export_frame_png(
         destination,
         Output::new(Format::Preview),
         still_range(frame)?,
-        Some(PreviewQuality::Full),
         RenderPass::Png,
         cancel,
         |_| {},
@@ -1760,8 +2015,7 @@ fn preview_frame(
         &path,
         Output::new(Format::Preview),
         still_range(frame)?,
-        quality,
-        RenderPass::Still,
+        RenderPass::Still(quality),
         cancel,
         |_| {},
     )?;
@@ -1812,10 +2066,10 @@ fn composition_start(project: &Project, mut start: u32) -> u32 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderPass<'a> {
-    Timeline,
+    Timeline(Option<PreviewQuality>),
     Delivery(&'a ExportDetails),
     Gif(u32),
-    Still,
+    Still(Option<PreviewQuality>),
     Png,
     Audio {
         sample_rate: u32,
@@ -1826,13 +2080,21 @@ enum RenderPass<'a> {
 
 impl RenderPass<'_> {
     fn is_still(self) -> bool {
-        matches!(self, Self::Still | Self::Png)
+        matches!(self, Self::Still(_) | Self::Png)
+    }
+
+    fn preview_quality(self) -> Option<PreviewQuality> {
+        match self {
+            Self::Timeline(quality) | Self::Still(quality) => quality,
+            Self::Png => Some(PreviewQuality::Full),
+            _ => None,
+        }
     }
 
     fn wants_audio(self) -> bool {
         matches!(
             self,
-            Self::Timeline | Self::Delivery(_) | Self::Audio { .. }
+            Self::Timeline(_) | Self::Delivery(_) | Self::Audio { .. }
         )
     }
 }
@@ -1846,13 +2108,13 @@ fn render_range(
     destination: &Path,
     settings: Output,
     range: Range<u32>,
-    preview: Option<PreviewQuality>,
     pass: RenderPass<'_>,
     cancel: &AtomicBool,
     progress: impl Fn(u8),
 ) -> Result<()> {
     let format = settings.format;
     let still = pass.is_still();
+    let preview = pass.preview_quality();
     let audio_only = matches!(pass, RenderPass::Audio { .. });
     if format == Format::Gif {
         ensure!(
@@ -1882,6 +2144,7 @@ fn render_range(
     let full_preview = preview.is_some_and(|quality| {
         quality == PreviewQuality::Full || quality == PreviewQuality::Auto && still
     });
+    let use_proxies = preview.is_some() && !full_preview && !audio_only;
     let raster = Raster {
         width,
         height,
@@ -1951,7 +2214,7 @@ fn render_range(
             }
             let mut font = None;
             let mut seek = 0;
-            let input = if let Some(title) = &asset.title {
+            let (input, video_input) = if let Some(title) = &asset.title {
                 std::fs::write(
                     folder.path().join(format!("title{}.txt", clips.len())),
                     &title.text,
@@ -1966,7 +2229,7 @@ fn render_range(
                     }
                     font = staged_fonts.get(&path).cloned();
                 }
-                None
+                (None, None)
             } else {
                 let path = asset
                     .path
@@ -1990,20 +2253,38 @@ fn render_range(
                     };
                     seek = first_frame.saturating_sub(FPS) / FPS * FPS;
                 }
-                let index = inputs.len();
-                inputs.push((std::path::absolute(path)?, seek));
-                Some(index)
+                let proxy = asset.proxy.as_ref().filter(|proxy| {
+                    use_proxies
+                        && track.kind == TrackKind::Video
+                        && asset.kind == AssetKind::Video
+                        && proxy.matches_source(path)
+                });
+                let input = if proxy.is_none() || pass.wants_audio() && audible(clip, asset) {
+                    let index = inputs.len();
+                    inputs.push((std::path::absolute(path)?, seek));
+                    Some(index)
+                } else {
+                    None
+                };
+                let video_input = if let Some(proxy) = proxy {
+                    let index = inputs.len();
+                    inputs.push((std::path::absolute(&proxy.path)?, seek));
+                    Some(index)
+                } else {
+                    input
+                };
+                (input, video_input)
             };
             let transition = clip
                 .transition
                 .filter(|_| adjacent && clip.start > origin && skip == 0);
-            let mask_input = if let Some(mask) = clip
-                .mask
-                .filter(|_| !audio_only && track.kind == TrackKind::Video)
+            let mask_input = if !audio_only
+                && track.kind == TrackKind::Video
+                && (clip.mask.is_some() || !clip.mask_strokes.is_empty())
             {
                 let index = inputs.len();
                 let path = folder.path().join(format!("mask{index}.pgm"));
-                stage_mask(&path, mask, raster, cancel)?;
+                stage_mask(&path, clip, raster, cancel)?;
                 inputs.push((path, 0));
                 Some(index)
             } else {
@@ -2043,6 +2324,7 @@ fn render_range(
                 clip,
                 asset,
                 input,
+                video_input,
                 mask_input,
                 font,
                 lut,
@@ -2072,8 +2354,10 @@ fn render_range(
         filter_graph(raster, &clips, range.end - origin, skipped, pass),
     )?;
     let suffix = match pass {
-        RenderPass::Timeline | RenderPass::Delivery(_) | RenderPass::Gif(_) => format.extension(),
-        RenderPass::Still => "rgb",
+        RenderPass::Timeline(_) | RenderPass::Delivery(_) | RenderPass::Gif(_) => {
+            format.extension()
+        }
+        RenderPass::Still(_) => "rgb",
         RenderPass::Png => "png",
         RenderPass::Audio { format, .. } => format.extension(),
     };
@@ -2336,7 +2620,7 @@ fn filter_graph(
                     layer.font.as_deref(),
                 )
             } else {
-                let input = layer.input.expect("media input");
+                let input = layer.video_input.expect("video input");
                 let retimed =
                     clip.speed_percent != crate::project::NORMAL_SPEED || clip.source_subframe != 0;
                 let video_clock = if retimed {

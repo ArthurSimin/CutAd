@@ -49,9 +49,11 @@ fn full_cadence_lossless_export_keeps_distinct_source_frames() -> Result<()> {
         .status()?;
     ensure!(success.success(), "Could not generate the 60 fps source.");
     let asset = probe(&input)?;
-    let mut project = Project::default();
-    project.width = 192;
-    project.height = 108;
+    let mut project = Project {
+        width: 192,
+        height: 108,
+        ..Project::default()
+    };
     project.tracks[0]
         .clips
         .push(Clip::new(asset.id.clone(), 0, 0, asset.frames));

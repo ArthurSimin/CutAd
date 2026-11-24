@@ -312,17 +312,12 @@ impl FontBrowser {
     }
 
     fn preview(&self, ctx: &egui::Context, font: &FontRef) -> Option<u64> {
-        let Some(path) = self
+        let path = self
             .fonts
             .iter()
             .find(|face| &face.reference == font)
-            .map(|face| &face.path)
-        else {
-            return None;
-        };
-        let Some(bytes) = sample_bytes(path) else {
-            return None;
-        };
+            .map(|face| &face.path)?;
+        let bytes = sample_bytes(path)?;
         let mut definition = FontDefinitions::default();
         let key = "cutad-font-sample".to_owned();
         definition

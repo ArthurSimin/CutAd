@@ -1,3 +1,4 @@
+mod audio_sync;
 mod beats;
 pub mod capcut;
 pub mod dafont;
