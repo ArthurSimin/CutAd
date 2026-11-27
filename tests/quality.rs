@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 use cutad::media::{
-    Format, Output, PreviewQuality, executable, probe, render_preview_frame_with, render_with,
+    Format, Output, PreviewQuality, executable, probe, render_preview_frame_with,
+    render_timeline_section, render_with,
 };
 use cutad::project::{Clip, Project, TitleStyle};
 use std::process::Command;
@@ -99,5 +100,82 @@ fn full_cadence_lossless_export_keeps_distinct_source_frames() -> Result<()> {
         decode(&input)?,
         "An unchanged 4:4:4 frame should survive the lossless route"
     );
+    Ok(())
+}
+
+#[test]
+fn seeking_trimmed_exports_preserves_lossless_frames_and_audio() -> Result<()> {
+    let folder = tempfile::tempdir()?;
+    let input = folder.path().join("source.mp4");
+    let ffmpeg = executable("ffmpeg")?;
+    let status = Command::new(&ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=192x108:r=25:d=9",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=327:sample_rate=44100:d=9",
+            "-c:v",
+            "libx264",
+            "-g",
+            "50",
+            "-threads:v",
+            "2",
+            "-c:a",
+            "aac",
+        ])
+        .arg(&input)
+        .status()?;
+    ensure!(status.success(), "Could not generate the source footage.");
+    let asset = probe(&input)?;
+    assert!(asset.preview_seek);
+    let mut project = Project {
+        width: 192,
+        height: 108,
+        ..Project::default()
+    };
+    let mut some_audio = Clip::new(asset.id.clone(), 0, 174, 33);
+    some_audio.set_audio_fade(6, 9);
+    let mut freeze = Clip::new(asset.id.clone(), 33, 227, 6);
+    freeze.freeze = true;
+    project.tracks[0].clips = vec![some_audio, freeze];
+    project.assets.push(asset);
+
+    let settings = Output {
+        fps: 60,
+        ..Output::new(Format::Mkv)
+    };
+    let cancel = AtomicBool::new(false);
+    let fast = folder.path().join("seek.mkv");
+    let reference = folder.path().join("reference.mkv");
+    render_timeline_section(&project, &fast, settings, 4..39, &cancel, |_| {})?;
+    project.assets[0].preview_seek = false;
+    render_timeline_section(&project, &reference, settings, 4..39, &cancel, |_| {})?;
+    for (stream, format) in [("0:v:0", "rawvideo"), ("0:a:0", "s16le")] {
+        let decode = |path: &std::path::Path| -> Result<Vec<u8>> {
+            let output = Command::new(&ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args(["-map", stream, "-threads", "1", "-f", format, "-"])
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(output.stdout)
+        };
+        let pixels_or_samples = decode(&fast)?;
+        assert!(!pixels_or_samples.is_empty());
+        assert!(
+            pixels_or_samples == decode(&reference)?,
+            "{stream} changed after seeking"
+        );
+    }
     Ok(())
 }

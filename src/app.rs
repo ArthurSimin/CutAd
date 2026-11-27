@@ -1706,6 +1706,7 @@ impl Editor {
             );
             return;
         }
+        self.stop_player();
         let snapshot = self.project.clone();
         self.start_job(
             ctx,

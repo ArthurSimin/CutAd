@@ -268,7 +268,8 @@ struct Layer<'a> {
     mask_input: Option<usize>,
     font: Option<String>,
     lut: Option<String>,
-    seek: u32,
+    video_seek: u32,
+    audio_seek: u32,
     start: u32,
     skip: u32,
     history: u32,
@@ -2213,7 +2214,8 @@ fn render_range(
                 continue;
             }
             let mut font = None;
-            let mut seek = 0;
+            let mut video_seek = 0;
+            let mut audio_seek = 0;
             let (input, video_input) = if let Some(title) = &asset.title {
                 std::fs::write(
                     folder.path().join(format!("title{}.txt", clips.len())),
@@ -2237,21 +2239,27 @@ fn render_range(
                     .filter(|path| !clip.slot && path.is_file())
                     .with_context(|| format!("Replace or relink media for {}.", asset.label))?;
                 if !audio_only
-                    && format == Format::Preview
+                    && (track.kind == TrackKind::Video || format == Format::Preview)
                     && asset.preview_seek
                     && asset.kind == AssetKind::Video
                     && clip.speed_percent == crate::project::NORMAL_SPEED
                     && clip.source_subframe == 0
-                    && (still || clip.pitch_semitones == 0)
                     && preroll.is_some()
-                    && !active().any(|effect| effect.preset.audio())
                 {
                     let first_frame = if clip.freeze {
                         clip.source
                     } else {
                         clip.source + skip - history
                     };
-                    seek = first_frame.saturating_sub(FPS) / FPS * FPS;
+                    // Whole seconds keep the same frame-rate conversion phase as decoding
+                    // from the beginning. Leave a second of input before the first frame.
+                    video_seek = first_frame.saturating_sub(FPS) / FPS * FPS;
+                    if format == Format::Preview
+                        && clip.pitch_semitones == 0
+                        && !active().any(|effect| effect.preset.audio())
+                    {
+                        audio_seek = video_seek;
+                    }
                 }
                 let proxy = asset.proxy.as_ref().filter(|proxy| {
                     use_proxies
@@ -2259,16 +2267,22 @@ fn render_range(
                         && asset.kind == AssetKind::Video
                         && proxy.matches_source(path)
                 });
-                let input = if proxy.is_none() || pass.wants_audio() && audible(clip, asset) {
+                let has_video = !audio_only && track.kind == TrackKind::Video;
+                let has_audio = pass.wants_audio() && audible(clip, asset);
+                let shared =
+                    proxy.is_none() && has_video && (!has_audio || video_seek == audio_seek);
+                let input = if shared || has_audio {
                     let index = inputs.len();
+                    let seek = if shared { video_seek } else { audio_seek };
                     inputs.push((std::path::absolute(path)?, seek));
                     Some(index)
                 } else {
                     None
                 };
-                let video_input = if let Some(proxy) = proxy {
+                let video_input = if has_video && !shared {
                     let index = inputs.len();
-                    inputs.push((std::path::absolute(&proxy.path)?, seek));
+                    let source = proxy.map_or(path, |proxy| &proxy.path);
+                    inputs.push((std::path::absolute(source)?, video_seek));
                     Some(index)
                 } else {
                     input
@@ -2328,7 +2342,8 @@ fn render_range(
                 mask_input,
                 font,
                 lut,
-                seek,
+                video_seek,
+                audio_seek,
                 start: first - origin,
                 skip,
                 history,
@@ -2629,16 +2644,23 @@ fn filter_graph(
                     format!(
                         "settb=1/1000000,setpts=(PTS-STARTPTS-{source_us})/{speed:.2},fps={rate}:start_time=0"
                     )
-                } else {
+                } else if layer.video_seek == 0 {
                     format!("setpts=PTS-STARTPTS,fps={rate}")
+                } else {
+                    // Input seeking shifts PTS by the requested time. Keep any
+                    // residual offset when a source has no frame at that instant.
+                    format!("fps={rate}:start_time=0")
                 };
-                let timing = if clip.freeze {
-                    let start = (clip.source - layer.seek) * factor;
+                let (timing, hold) = if clip.freeze {
+                    let start = (clip.source - layer.video_seek) * factor;
                     let end = start + 1;
                     let frames = needed * factor - 1;
-                    format!(
-                        "tpad=stop_mode=clone:stop=1,trim=start_frame={start}:end_frame={end},\
-                             settb=1/{rate},setpts=N,tpad=stop_mode=clone:stop={frames}"
+                    // Crop and resize the held frame once, before duplicating it.
+                    (
+                        format!(
+                            "tpad=stop_mode=clone:stop=1,trim=start_frame={start}:end_frame={end}"
+                        ),
+                        format!(",tpad=stop_mode=clone:stop={frames}"),
                     )
                 } else {
                     let offset = if retimed {
@@ -2646,7 +2668,7 @@ fn filter_graph(
                     } else if asset.kind == AssetKind::Image {
                         0
                     } else {
-                        clip.source + source_offset - layer.seek
+                        clip.source + source_offset - layer.video_seek
                     };
                     let pad = if asset.kind == AssetKind::Image {
                         needed
@@ -2655,16 +2677,19 @@ fn filter_graph(
                     };
                     let end = (offset + needed) * factor;
                     let offset = offset * factor;
-                    format!(
-                        "tpad=stop_mode=clone:stop_duration={},trim=start_frame={offset}:end_frame={end}",
-                        seconds(pad)
+                    (
+                        format!(
+                            "tpad=stop_mode=clone:stop_duration={},trim=start_frame={offset}:end_frame={end}",
+                            seconds(pad)
+                        ),
+                        String::new(),
                     )
                 };
                 let framing = framing_filters(clip.framing);
                 format!(
                     "[{input}:V:0]{video_clock},{timing},settb=1/{rate},setpts=N{framing},\
                          scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1:flags=lanczos,\
-                         setsar=1,format={alpha},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0"
+                         setsar=1,format={alpha},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0{hold}"
                 )
             };
             if let Some(key) = clip.chroma_key {
@@ -2766,7 +2791,7 @@ fn filter_graph(
             let end = source_start + window_skip + i64::from(layer.length) * SAMPLES_PER_FRAME;
             if end > 0 {
                 let fx = effects(true);
-                let seek = i64::from(layer.seek) * SAMPLES_PER_FRAME;
+                let seek = i64::from(layer.audio_seek) * SAMPLES_PER_FRAME;
                 let from = if fx.is_empty() {
                     source_start + window_skip
                 } else {
